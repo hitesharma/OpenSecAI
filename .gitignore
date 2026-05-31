@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+*.egg-info/
+
+# Reports — generated at runtime, not source
+report/
+
+# direnv — allow file is machine-local
+.direnv/
+
+# Misc
+*.json
+!pyproject.toml
+.DS_Store
