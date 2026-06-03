@@ -15,9 +15,12 @@ import subprocess
 import sys
 from typing import Annotated, Any, Callable, List, Optional, TypedDict
 
+import shutil
+
 import click
 import operator
 import polars as pl
+from filelock import FileLock
 from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -50,6 +53,10 @@ class AgentState(TypedDict, total=False):
 
     # Optional sink for streaming log lines to a JobEvent bus.
     log_fn: Optional[LogFn]
+
+    # Set by the sidecar when the job is cancelled; each node checks this
+    # before starting work so the run stops at the next node boundary.
+    cancel_event: Optional[Any]
 
     # Graph-internal fields
     fixed_vulns: List[dict]
@@ -91,13 +98,71 @@ def _cwd(state: AgentState) -> str:
     return state.get("cwd") or os.getcwd()
 
 
+def _run_tracked(state: AgentState, cmd: list, **kwargs) -> subprocess.CompletedProcess:
+    """subprocess.run() that writes the child PID to active_pid while running.
+
+    Rust's delete_agent_run reads this file and SIGKILLs the PID for instant
+    termination without waiting for the next node-boundary cancel check.
+    """
+    capture = kwargs.pop("capture_output", False)
+    check = kwargs.pop("check", False)
+    if capture:
+        kwargs.setdefault("stdout", subprocess.PIPE)
+        kwargs.setdefault("stderr", subprocess.PIPE)
+
+    proc = subprocess.Popen(cmd, **kwargs)
+    pid_path = os.path.join(_run_dir(state), "active_pid")
+    try:
+        with open(pid_path, "w") as f:
+            f.write(str(proc.pid))
+        stdout, stderr = proc.communicate()
+    finally:
+        try:
+            os.remove(pid_path)
+        except FileNotFoundError:
+            pass
+
+    result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    if check and proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd, stdout, stderr)
+    return result
+
+
+def _check_cancel(state: AgentState) -> None:
+    ev = state.get("cancel_event")
+    if ev is not None and ev.is_set():
+        raise RuntimeError("Run cancelled by user.")
+
+
+def _update_index(index_path: str, updater) -> None:
+    lock_path = index_path + ".lock"
+    with FileLock(lock_path):
+        existing: list[dict] = []
+        if os.path.exists(index_path):
+            with open(index_path) as f:
+                existing = json.load(f)
+        updater(existing)
+        with open(index_path, "w") as f:
+            json.dump(existing, f, indent=2)
+
+
 # ── Node 1: Scan with Trivy ─────────────────────────────────────────────────
 def scan_trivy_node(state: AgentState) -> dict:
+    _check_cancel(state)
+    index_path = os.path.join(_index_dir(state), "index.json")
+    _update_index(index_path, lambda entries: entries.append({
+        "run_id": state["run_id"],
+        "timestamp": state.get("run_ts_iso"),
+        "status": "running",
+        "summary": {},
+    }))
+
     _log(state, "🔍 Running Trivy vulnerability scan...")
     try:
         env = os.environ.copy()
         env["DOCKER_CONFIG"] = "/tmp"
-        result = subprocess.run(
+        result = _run_tracked(
+            state,
             ["trivy", "fs", "--format", "json", "--severity",
              "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL", "--pkg-types", "library", "."],
             capture_output=True, text=True, check=True, env=env, cwd=_cwd(state),
@@ -133,6 +198,7 @@ def scan_trivy_node(state: AgentState) -> dict:
 
 # ── Node 2: Update Dependencies ─────────────────────────────────────────────
 def update_dependencies_node(state: AgentState) -> dict:
+    _check_cancel(state)
     fixed_vulns = state.get("fixed_vulns", [])
     affected_vulns = state.get("affected_vulns", [])
 
@@ -173,10 +239,11 @@ def update_dependencies_node(state: AgentState) -> dict:
 
 # ── Node 3: Test and Verify Build ───────────────────────────────────────────
 def run_tests_node(state: AgentState) -> dict:
+    _check_cancel(state)
     cwd = _cwd(state)
     _log(state, "🛠️ Performing static analysis of codebase...")
     subprocess.run(["go", "mod", "tidy"], capture_output=True, cwd=cwd)
-    build_res = subprocess.run(["go", "vet", "./..."], capture_output=True, text=True, cwd=cwd)
+    build_res = _run_tracked(state, ["go", "vet", "./..."], capture_output=True, text=True, cwd=cwd)
 
     if build_res.returncode != 0:
         _log(state, "❌ Breaking changes detected.")
@@ -188,6 +255,7 @@ def run_tests_node(state: AgentState) -> dict:
 
 # ── Node 4: LLM Self-Healing ────────────────────────────────────────────────
 def analyze_and_fix_node(state: AgentState) -> dict:
+    _check_cancel(state)
     logs = state.get("build_logs", "")
     iterations = state.get("iterations", 0)
     cwd = _cwd(state)
@@ -236,6 +304,7 @@ def analyze_and_fix_node(state: AgentState) -> dict:
 
 # ── Node 5: Claude Code Agent ───────────────────────────────────────────────
 def claude_code_node(state: AgentState) -> dict:
+    _check_cancel(state)
     logs = state.get("build_logs", "")
     affected_vulns = state.get("affected_vulns", [])
     iterations = state.get("iterations", 0)
@@ -265,10 +334,13 @@ def claude_code_node(state: AgentState) -> dict:
     cmd = base_cmd + (["--resume", session_id, prompt] if session_id else [prompt])
 
     new_session_id = session_id
+    pid_path = os.path.join(_run_dir(state), "active_pid")
     try:
         _log(state, f"running cmd: {' '.join(cmd)}")
         _log(state, "--- Claude Code Output ---")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd)
+        with open(pid_path, "w") as f:
+            f.write(str(proc.pid))
         lines: list[str] = []
         assert proc.stdout is not None
         for line in proc.stdout:
@@ -285,6 +357,11 @@ def claude_code_node(state: AgentState) -> dict:
             pass
     except Exception as e:  # noqa: BLE001
         _log(state, f"❌ Failed to run Claude Code: {e}", err=True)
+    finally:
+        try:
+            os.remove(pid_path)
+        except FileNotFoundError:
+            pass
 
     return {"iterations": iterations + 1, "claude_session_id": new_session_id}
 
@@ -293,18 +370,20 @@ def claude_code_node(state: AgentState) -> dict:
 def route_after_test(state: AgentState) -> str:
     if state.get("test_passed"):
         return "final_scan"
-    if state.get("iterations", 0) >= 3:
+    if state.get("iterations", 0) >= 1:
         return "final_scan"
     return "claude_code"
 
 
 # ── Node 6: Final Scan ──────────────────────────────────────────────────────
 def final_scan_node(state: AgentState) -> dict:
+    _check_cancel(state)
     _log(state, "🔍 Running final Trivy scan...")
     try:
         env = os.environ.copy()
         env["DOCKER_CONFIG"] = "/tmp"
-        result = subprocess.run(
+        result = _run_tracked(
+            state,
             ["trivy", "fs", "--format", "json", "--severity",
              "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL", "--pkg-types", "library", "."],
             capture_output=True, text=True, check=True, env=env, cwd=_cwd(state),
@@ -320,6 +399,7 @@ def final_scan_node(state: AgentState) -> dict:
 
 # ── Node 7: Diff Report ─────────────────────────────────────────────────────
 def diff_report_node(state: AgentState) -> dict:
+    _check_cancel(state)
     _log(state, "📊 Generating vulnerability diff report...")
     run_dir = _run_dir(state)
     start_path = os.path.join(run_dir, "start.json")
@@ -353,29 +433,45 @@ def diff_report_node(state: AgentState) -> dict:
     with open(diff_path, "w") as f:
         json.dump(diff, f, indent=2)
 
-    index_entry = {
-        "run_id": state["run_id"],
-        "timestamp": state.get("run_ts_iso") or _now_iso(),
-        "status": "completed",
-        "summary": {
-            "fixed": len(diff["fixed"]),
-            "persisted": len(diff["persisted"]),
-            "new": len(diff["new"]),
-        },
-    }
     index_path = os.path.join(_index_dir(state), "index.json")
-    existing: list[dict] = []
-    if os.path.exists(index_path):
-        with open(index_path) as f:
-            existing = json.load(f)
-    existing.append(index_entry)
-    with open(index_path, "w") as f:
-        json.dump(existing, f, indent=2)
+    run_id = state["run_id"]
+    summary = {"fixed": len(diff["fixed"]), "persisted": len(diff["persisted"]), "new": len(diff["new"])}
+
+    def _complete(entries: list[dict]) -> None:
+        for entry in entries:
+            if entry.get("run_id") == run_id:
+                entry["status"] = "completed"
+                entry["summary"] = summary
+                break
+
+    _update_index(index_path, _complete)
 
     _log(state, f"fixed: {len(diff['fixed'])}  |  new: {len(diff['new'])}  |  persisted: {len(diff['persisted'])}")
     _log(state, f"💾 Diff saved to: {diff_path}")
     _log(state, f"📋 Index updated: {index_path}")
     return {}
+
+
+def cleanup_run(state: AgentState) -> None:
+    """Remove the run directory and its index.json entry.
+
+    Called on cancellation or unexpected kill so partial artifacts don't linger
+    as a permanent "running" ghost entry.  Both operations are idempotent, so
+    racing with Rust's delete_agent_run is harmless.
+    """
+    run_dir = _run_dir(state)
+    shutil.rmtree(run_dir, ignore_errors=True)
+
+    index_path = os.path.join(_index_dir(state), "index.json")
+    run_id = state["run_id"]
+
+    def _remove(entries: list[dict]) -> None:
+        entries[:] = [e for e in entries if e.get("run_id") != run_id]
+
+    try:
+        _update_index(index_path, _remove)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _now_iso() -> str:
@@ -425,6 +521,7 @@ def make_initial_state(
         "run_ts_iso": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "cwd": repo_path,
         "log_fn": log_fn,
+        "cancel_event": None,
         "fixed_vulns": [],
         "affected_vulns": [],
         "build_logs": "",
