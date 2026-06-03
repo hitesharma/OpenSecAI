@@ -1,0 +1,123 @@
+/* OpenSecAI — dark security console
+   Charcoal dark theme with indigo/violet accent */
+
+:root {
+  /* ACCENT */
+  --accent:            #6366F1;
+  --accent-bright:     #818CF8;
+  --accent-dim:        #4F46E5;
+  --accent-soft:       rgba(99,102,241,0.14);
+  --accent-ring:       rgba(99,102,241,0.35);
+
+  /* SURFACES */
+  --bg:                #15171C;
+  --rail:              #101216;
+  --surface:           #1B1E24;
+  --surface-2:         #21252C;
+  --surface-3:         #282D35;
+  --terminal:          #0E1014;
+
+  /* BORDERS */
+  --border:            #2A2F38;
+  --border-soft:       #23272F;
+  --border-strong:     #353B45;
+
+  /* TEXT */
+  --text:              #E9ECF2;
+  --text-2:            #A6AEBC;
+  --text-3:            #6E7686;
+  --text-on-accent:    #FFFFFF;
+
+  /* STATUS */
+  --success:           #34D399;  --success-bg: rgba(52,211,153,0.13);
+  --warning:           #FBBF24;  --warning-bg: rgba(251,191,36,0.13);
+  --error:             #F87171;  --error-bg:   rgba(248,113,113,0.13);
+  --info:              #60A5FA;  --info-bg:    rgba(96,165,250,0.13);
+  --idle:              #6E7686;  --idle-bg:    rgba(110,118,134,0.12);
+
+  /* SEVERITY */
+  --sev-critical:      #F43F5E;  --sev-critical-bg: rgba(244,63,94,0.13);
+  --sev-high:          #FB923C;  --sev-high-bg:     rgba(251,146,60,0.13);
+  --sev-medium:        #FBBF24;  --sev-medium-bg:   rgba(251,191,36,0.13);
+  --sev-low:           #60A5FA;  --sev-low-bg:      rgba(96,165,250,0.13);
+
+  /* TYPE */
+  --font-heading: 'Montserrat', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --font-body:    'Nunito', system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  --font-mono:    'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --text-xs:   11px;  --text-sm:   12px;  --text-base: 14px;
+  --text-md:   15px;  --text-lg:   18px;  --text-xl:   22px;
+  --text-2xl:  28px;  --text-3xl:  38px;
+
+  /* SPACING */
+  --space-1: 4px;   --space-2: 8px;   --space-3: 12px;  --space-4: 16px;
+  --space-5: 20px;  --space-6: 24px;  --space-8: 32px;  --space-10: 40px;
+  --space-12: 48px; --space-16: 64px;
+
+  /* RADII */
+  --r-card: 14px;  --r-input: 9px;  --r-badge: 7px;  --r-pill: 999px;
+
+  /* ELEVATION */
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-md: 0 6px 20px rgba(0,0,0,0.45);
+  --shadow-lg: 0 18px 50px rgba(0,0,0,0.55);
+
+  /* MOTION */
+  --t-fast: 110ms ease;
+  --t-base: 200ms ease;
+  --t-slow: 320ms ease-in-out;
+
+  --rail-width: 268px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root { height: 100%; }
+
+::selection { background: var(--accent-soft); }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #2C313B; border-radius: 999px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: #3A414D; background-clip: padding-box; }
+::-webkit-scrollbar-track { background: transparent; }
+
+h1,h2,h3,h4 { font-family: var(--font-heading); color: var(--text); margin: 0; letter-spacing: -0.01em; }
+p { margin: 0; }
+button { font-family: var(--font-heading); }
+
+.mono { font-family: var(--font-mono); }
+.section-label {
+  font-family: var(--font-heading);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.10em;
+  color: var(--text-3);
+}
+
+@keyframes dotPulse {
+  0%   { box-shadow: 0 0 0 0 var(--pulse-color, rgba(96,165,250,0.5)); }
+  70%  { box-shadow: 0 0 0 6px rgba(96,165,250,0); }
+  100% { box-shadow: 0 0 0 0 rgba(96,165,250,0); }
+}
+.pulse-dot { animation: dotPulse 1.8s ease-out infinite; }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 0.9s linear infinite; }
+
+button:focus-visible, input:focus-visible, a:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px var(--accent-ring);
+}
