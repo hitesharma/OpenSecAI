@@ -86,12 +86,35 @@ export function AgentRunHistoryPage({ project, rootDir, agentId, onBack, onLogs,
     };
   }, [rootDir, project, agentId]);
 
+  // Poll every 5 s while any run is still "running" to pick up status transitions.
+  useEffect(() => {
+    if (!runs || !runs.some((r) => r.status === "running")) return;
+    const id = setInterval(() => {
+      api
+        .listAgentRuns(rootDir, project, agentId)
+        .then((data) => {
+          const sorted = [...data].sort((a, b) => (a.timestamp < b.timestamp ? 1 : -1));
+          setRuns(sorted);
+        })
+        .catch(() => {});
+    }, 5000);
+    return () => clearInterval(id);
+  }, [runs, rootDir, project, agentId]);
+
   async function confirmDelete() {
     if (!pendingDelete) return;
     const runId = pendingDelete.run_id;
     setDeleting(true);
     setDeleteError(null);
     try {
+      // Cancel the running job before deleting so the agent stops at the next node boundary.
+      if (pendingDelete.status === "running") {
+        const jobs = await api.listJobs();
+        const job = jobs.find(
+          (j) => j.agent === agentId && j.project === project && j.status === "running",
+        );
+        if (job) await api.cancelJob(job.id);
+      }
       await api.deleteAgentRun(rootDir, project, agentId, runId);
       setRuns((prev) => (prev ? prev.filter((x) => x.run_id !== runId) : prev));
       setPendingDelete(null);
@@ -116,7 +139,7 @@ export function AgentRunHistoryPage({ project, rootDir, agentId, onBack, onLogs,
     whiteSpace: "nowrap",
   };
 
-  const gridCols = "1.6fr 1fr 0.8fr 0.8fr 0.9fr 1.3fr";
+  const gridCols = "1.6fr 1fr 0.8fr 0.8fr 0.9fr 2.5fr";
 
   return (
     <div style={{ padding: "36px 44px", maxWidth: 1100, margin: "0 auto" }}>
@@ -168,7 +191,7 @@ export function AgentRunHistoryPage({ project, rootDir, agentId, onBack, onLogs,
           }}
         >
           {["Timestamp", "Status", "Fixed", "New", "Persisted", "Actions"].map((h) => (
-            <div key={h} className="section-label" style={{ padding: "0 20px", fontSize: 10.5, textAlign: "left" }}>
+            <div key={h} className="section-label" style={{ padding: "0 20px", fontSize: 10.5, textAlign: "center" }}>
               {h}
             </div>
           ))}
@@ -203,7 +226,7 @@ export function AgentRunHistoryPage({ project, rootDir, agentId, onBack, onLogs,
                 {formatTimestamp(r.timestamp)}
               </div>
               <div style={cell}>
-                <StatusPill status={r.status === "partial" ? "failed" : r.status} />
+                <StatusPill status={r.status === "partial" ? "failed" : r.status as "running" | "completed" | "failed"} />
               </div>
               <div style={cell}>
                 <CountCell value={r.summary.fixed} color="var(--success)" />
@@ -216,8 +239,10 @@ export function AgentRunHistoryPage({ project, rootDir, agentId, onBack, onLogs,
               </div>
               <div style={{ ...cell, display: "flex", gap: 4, justifyContent: "flex-start" }}>
                 <Button variant="ghost" size="sm" icon="terminal" onClick={() => onLogs(r)}>Logs</Button>
-                {r.status === "completed" && (
-                  <Button variant="ghost" size="sm" icon="eye" onClick={() => onResults(r)}>Results</Button>
+                {(r.status === "completed" || r.status === "running") && (
+                  <span style={{ opacity: r.status === "running" ? 0.4 : 1, cursor: r.status === "running" ? "not-allowed" : undefined }}>
+                    <Button variant="ghost" size="sm" icon="eye" onClick={() => onResults(r)} disabled={r.status === "running"}>Result</Button>
+                  </span>
                 )}
                 <Button variant="ghost" size="sm" icon="trash" onClick={() => { setPendingDelete(r); setDeleteError(null); }} />
               </div>

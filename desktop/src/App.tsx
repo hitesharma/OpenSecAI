@@ -426,6 +426,66 @@ export default function App() {
             agentId={historyAgent}
             onBack={() => setScreen("dashboard")}
             onLogs={(entry) => {
+              setLogsBackScreen("agent_history");
+              const rootDir = currentProject?.root_dir ?? "";
+
+              if (entry.status === "running") {
+                // Case 1: this session already owns the live stream for this agent.
+                if (liveRunId && runningAgent === historyAgent) {
+                  setScreen("logs");
+                  return;
+                }
+
+                // Case 2: run was started outside this session — look it up via HTTP.
+                const r: Run = {
+                  id: entry.run_id,
+                  agent: historyAgent,
+                  status: "running",
+                  started: entry.timestamp,
+                  duration: "—",
+                };
+                setCurrentRun(r);
+                setLiveLogs([{ lvl: "INFO", msg: "Connecting to live run…" }]);
+                setScreen("logs");
+
+                api.listJobs().then((jobs) => {
+                  const job = jobs.find(
+                    (j) => j.agent === historyAgent && j.project === project && j.status === "running",
+                  );
+                  if (!job) {
+                    setLiveLogs([{ lvl: "WARN", msg: "No active job stream found. The run may have been started outside this session." }]);
+                    return;
+                  }
+                  if (wsRef.current) {
+                    try { wsRef.current.close(); } catch { /* noop */ }
+                    wsRef.current = null;
+                  }
+                  const ws = openJobStream(job.id);
+                  wsRef.current = ws;
+                  setRunningAgent(historyAgent);
+                  setLiveRunId(job.id);
+                  setLiveLogs([]);
+                  ws.onmessage = (msg) => {
+                    try {
+                      const ev: JobEvent = JSON.parse(msg.data);
+                      setLiveLogs((ls) => [...ls, eventToLogLine(ev)]);
+                      if (ev.kind === "done") finishRun(job.id, "completed", historyAgent);
+                      else if (ev.kind === "error") finishRun(job.id, "failed", historyAgent);
+                    } catch { /* ignore malformed frames */ }
+                  };
+                  ws.onerror = () => setLiveLogs((ls) => [...ls, { lvl: "ERROR", msg: "WebSocket connection error" }]);
+                  ws.onclose = () => {
+                    api.getJob(job.id).then((j) => {
+                      if (j.status === "completed" || j.status === "failed") finishRun(job.id, j.status, historyAgent);
+                    }).catch(() => {});
+                  };
+                }).catch(() => {
+                  setLiveLogs([{ lvl: "ERROR", msg: "Failed to query active jobs." }]);
+                });
+                return;
+              }
+
+              // Past run — load static transcript.
               const r: Run = {
                 id: entry.run_id,
                 agent: historyAgent,
@@ -434,10 +494,8 @@ export default function App() {
                 duration: "—",
               };
               setCurrentRun(r);
-              setLogsBackScreen("agent_history");
               setLiveLogs([{ lvl: "INFO", msg: "Loading transcript…" }]);
               setScreen("logs");
-              const rootDir = currentProject?.root_dir ?? "";
               api.getRunEvents(rootDir, project, historyAgent, entry.run_id).then((evs) => {
                 if (evs.length === 0) {
                   setLiveLogs([{ lvl: "INFO", msg: "No transcript was saved for this run (pre-persistence or run still in progress)." }]);

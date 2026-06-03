@@ -59,7 +59,9 @@ export function DashboardPage({ project, rootDir, repoPath, lastRun, runs, onAge
     api.listAgentRuns(rootDir, project, "dep_scan")
       .then((entries) => {
         setTotalRuns(entries.length);
-        setLastEntry(entries.length > 0 ? entries[entries.length - 1] : null);
+        // If the newest entry is still running, use the previous completed entry for findings.
+        const completed = entries.filter((e) => e.status !== "running");
+        setLastEntry(completed.length > 0 ? completed[completed.length - 1] : null);
       })
       .catch(() => { setTotalRuns(null); setLastEntry(null); });
   }, [rootDir, project, runs]);
@@ -82,7 +84,7 @@ export function DashboardPage({ project, rootDir, repoPath, lastRun, runs, onAge
         <Button icon="play" onClick={onRunDep}>Run dep_scan</Button>
       </div>
 
-      {/* Health hero */}
+      {/* Health hero
       {scanned ? (
         <div style={{
           marginTop: 28,
@@ -135,7 +137,7 @@ export function DashboardPage({ project, rootDir, repoPath, lastRun, runs, onAge
             </p>
           </div>
         </div>
-      )}
+      )} */}
 
       {/* Stats */}
       <div style={{ marginTop: 16, display: "flex", gap: 16 }}>

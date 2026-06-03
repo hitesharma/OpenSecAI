@@ -49,7 +49,7 @@ export interface AgentRunSummary {
 export interface AgentRunEntry {
   run_id: string;
   timestamp: string;
-  status: "completed" | "failed" | "partial";
+  status: "running" | "completed" | "failed" | "partial";
   summary: AgentRunSummary;
 }
 
