@@ -1,8 +1,13 @@
 mod sidecar;
 
+#[cfg(unix)]
+use libc;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, RunEvent};
+
+static QUIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
 
 use sidecar::SidecarHandle;
 
@@ -138,6 +143,23 @@ fn delete_agent_run(
     let base = project_reports_base(&app, &root_dir, &project, &agent)?;
 
     let run_dir = base.join(&run_id);
+
+    // Kill any active subprocess before removing files. The runner writes its
+    // current child's PID to active_pid so we can SIGKILL it immediately
+    // without waiting for the next node-boundary cancel check.
+    #[cfg(unix)]
+    {
+        let pid_path = run_dir.join("active_pid");
+        if let Ok(s) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = s.trim().parse::<libc::pid_t>() {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                    libc::killpg(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
     if run_dir.exists() {
         std::fs::remove_dir_all(&run_dir)
             .map_err(|e| format!("failed to delete {}: {e}", run_dir.display()))?;
@@ -167,6 +189,7 @@ fn delete_agent_run(
 fn quit_app(app: tauri::AppHandle) {
     let state: tauri::State<'_, SidecarHandle> = app.state();
     sidecar::kill(&state);
+    QUIT_CONFIRMED.store(true, Ordering::SeqCst);
     app.exit(0);
 }
 
@@ -197,6 +220,10 @@ pub fn run() {
             // so we only need this arm on macOS.
             #[cfg(target_os = "macos")]
             RunEvent::ExitRequested { api, .. } => {
+                if QUIT_CONFIRMED.load(Ordering::SeqCst) {
+                    // User confirmed quit via the dialog — let the exit through.
+                    return;
+                }
                 api.prevent_exit();
                 if let Some(win) = app_handle.get_webview_window("main") {
                     let _ = win.emit("quit-requested", ());

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -55,7 +56,7 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
     import traceback as _tb
 
     # Lazy import — keeps heavy LLM deps out of the process until a run starts.
-    from opensecai.agents.dep_scan.runner import build_workflow, make_initial_state
+    from opensecai.agents.dep_scan.runner import build_workflow, cleanup_run, make_initial_state
     from opensecai.core.paths import agent_run_dir
 
     # ── Phase 1: pre-workflow setup (project resolve, paths, log sink) ──
@@ -91,8 +92,11 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
         asyncio.run_coroutine_threadsafe(emit("log", msg), loop)
 
     # ── Phase 2: workflow execution (LangGraph nodes) ──
+    cancel_event = threading.Event()
+
     def _invoke() -> None:
         initial_state["log_fn"] = log_fn
+        initial_state["cancel_event"] = cancel_event
         try:
             workflow = build_workflow()
             workflow.invoke(initial_state)
@@ -104,7 +108,16 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
             log_fn(_tb.format_exc())
             raise
 
-    await asyncio.to_thread(_invoke)
+    try:
+        await asyncio.to_thread(_invoke)
+    except asyncio.CancelledError:
+        cancel_event.set()  # Signal the worker thread to stop at next node boundary.
+        await asyncio.to_thread(cleanup_run, initial_state)
+        raise
+    except Exception:
+        await asyncio.to_thread(cleanup_run, initial_state)
+        raise
+
     _write_event("done", "ok")
     await emit("log", "✅ dep_scan completed")
 
