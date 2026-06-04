@@ -46,13 +46,6 @@ export interface AgentRunSummary {
   new: number;
 }
 
-export interface AgentRunEntry {
-  run_id: string;
-  timestamp: string;
-  status: "running" | "completed" | "failed" | "partial";
-  summary: AgentRunSummary;
-}
-
 /**
  * Raw Trivy-style vulnerability entry as written to `diff.json`.
  * Only the fields the UI uses are typed; the rest are tolerated.
@@ -77,7 +70,15 @@ export interface RawScanDiff {
 
 /** One line from `events.jsonl` written by the agent runner. */
 export interface RawEventLine {
-  kind: "log" | "status" | "error" | "done";
+  kind: "log" | "status" | "error" | "done" | "pause";
   payload: string;
   timestamp: string;
+}
+
+/** Also add "paused" as a valid run status for the index.json entry. */
+export interface AgentRunEntry {
+  run_id: string;
+  timestamp: string;
+  status: "running" | "completed" | "failed" | "partial" | "paused";
+  summary: AgentRunSummary;
 }

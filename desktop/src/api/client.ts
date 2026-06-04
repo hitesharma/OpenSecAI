@@ -49,7 +49,7 @@ export interface Job {
 
 export interface JobEvent {
   job_id: string;
-  kind: "log" | "status" | "error" | "done";
+  kind: "log" | "status" | "error" | "done" | "pause";
   payload: string;
   timestamp: string;
 }
@@ -111,6 +111,17 @@ export const api = {
 
   cancelJob(id: string): Promise<{ cancelled: boolean }> {
     return request(`/jobs/${id}/cancel`, { method: "POST" });
+  },
+
+  /**
+   * Send a user decision to a paused job, unblocking its worker thread.
+   * Maps to POST /jobs/{jobId}/decision on the sidecar.
+   */
+  resolveJobDecision(jobId: string, decision: string): Promise<{ resumed: boolean; decision: string }> {
+    return request(`/jobs/${encodeURIComponent(jobId)}/decision`, {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    });
   },
 
   /**

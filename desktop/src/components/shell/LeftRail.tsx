@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from "react";
 import { Icon } from "../Icon";
 import { Logo } from "../Logo";
 import { StatusPill } from "../ui/StatusPill";
+import { useNotifications } from "../../notifications/NotificationContext";
 import { AGENTS } from "../../mockData";
 import type { Agent, Screen } from "../../types";
 import type { Project } from "../../api/client";
@@ -54,10 +55,11 @@ function RailItem({ icon, label, active, onClick, trailing }: RailItemProps) {
 interface AgentRailItemProps {
   agent: Agent;
   runningAgent: string | null;
+  hasAlert: boolean;
   onClick: (a: Agent) => void;
 }
 
-function AgentRailItem({ agent, runningAgent, onClick }: AgentRailItemProps) {
+function AgentRailItem({ agent, runningAgent, hasAlert, onClick }: AgentRailItemProps) {
   const [h, setH] = useState(false);
   const isRunning = runningAgent === agent.id;
   const dim = !agent.enabled;
@@ -110,6 +112,21 @@ function AgentRailItem({ agent, runningAgent, onClick }: AgentRailItemProps) {
           {agent.name}
         </span>
       </span>
+      {hasAlert && (
+        <span title="Waiting for user input" style={{
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          width: 18,
+          height: 18,
+          borderRadius: "50%",
+          background: "var(--warning-soft, rgba(234,179,8,0.18))",
+          color: "var(--warning, #ca8a04)",
+          flexShrink: 0,
+        }}>
+          <Icon name="alertTriangle" size={11} />
+        </span>
+      )}
       {agent.enabled
         ? <StatusPill status={isRunning ? "running" : "idle"} mini />
         : <span style={{ fontSize: 10, fontFamily: "var(--font-heading)", fontWeight: 600, color: "var(--text-3)", letterSpacing: "0.04em", textTransform: "uppercase" }}>Soon</span>
@@ -172,9 +189,17 @@ interface LeftRailProps {
   onAgentClick: (a: Agent) => void;
   onSwitch: (name: string) => void;
   onExit: () => void;
+  pendingNotifications?: number;
 }
 
-export function LeftRail({ screen, onNav, project, projects, runningAgent, onAgentClick, onSwitch, onExit }: LeftRailProps) {
+export function LeftRail({ screen, onNav, project, projects, runningAgent, onAgentClick, onSwitch, onExit, pendingNotifications = 0 }: LeftRailProps) {
+  const { notifications } = useNotifications();
+  const alertAgents = new Set(
+    notifications
+      .filter((n) => n.status === "pending" && n.payload.type === "pause")
+      .map((n) => n.agentId)
+  );
+
   const [dropOpen, setDropOpen] = useState(false);
   const [projHover, setProjHover] = useState(false);
   const dropRef = useRef<HTMLDivElement>(null);
@@ -282,7 +307,7 @@ export function LeftRail({ screen, onNav, project, projects, runningAgent, onAge
         <div className="section-label" style={{ padding: "8px 12px 8px" }}>Security Agents</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           {AGENTS.map((a) => (
-            <AgentRailItem key={a.id} agent={a} runningAgent={runningAgent} onClick={onAgentClick} />
+            <AgentRailItem key={a.id} agent={a} runningAgent={runningAgent} hasAlert={alertAgents.has(a.id)} onClick={onAgentClick} />
           ))}
         </div>
       </div>
@@ -290,7 +315,24 @@ export function LeftRail({ screen, onNav, project, projects, runningAgent, onAge
       {/* Footer status */}
       <div style={{ padding: "12px 18px", borderTop: "1px solid var(--border-soft)", display: "flex", alignItems: "center", gap: 9 }}>
         <span style={{ width: 7, height: 7, borderRadius: "50%", background: "var(--success)" }} />
-        {/* <span style={{ fontSize: 12, color: "var(--text-3)", fontFamily: "var(--font-body)" }}>1 of 7 agents active</span> */}
+        {pendingNotifications > 0 && (
+          <span style={{
+            marginLeft: "auto",
+            display: "inline-flex",
+            alignItems: "center",
+            gap: 5,
+            padding: "2px 8px",
+            borderRadius: "var(--r-pill)",
+            background: "var(--warning-soft, rgba(234,179,8,0.15))",
+            color: "var(--warning, #ca8a04)",
+            fontFamily: "var(--font-heading)",
+            fontWeight: 700,
+            fontSize: 11,
+          }}>
+            <Icon name="alertTriangle" size={12} />
+            {pendingNotifications}
+          </span>
+        )}
       </div>
     </aside>
   );

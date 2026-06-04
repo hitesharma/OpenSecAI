@@ -226,7 +226,11 @@ export function AgentRunHistoryPage({ project, rootDir, agentId, onBack, onLogs,
                 {formatTimestamp(r.timestamp)}
               </div>
               <div style={cell}>
-                <StatusPill status={r.status === "partial" ? "failed" : r.status as "running" | "completed" | "failed"} />
+                <StatusPill status={
+                  r.status === "partial" ? "failed" :
+                  r.status === "paused"  ? "paused"  :
+                  r.status as "running" | "completed" | "failed"
+                } />
               </div>
               <div style={cell}>
                 <CountCell value={r.summary.fixed} color="var(--success)" />

@@ -14,8 +14,10 @@ import { RunHistoryPage } from "./pages/RunHistoryPage";
 import { AgentRunHistoryPage } from "./pages/AgentRunHistoryPage";
 import { LogViewerPage } from "./pages/LogViewerPage";
 import { ResultsPage } from "./pages/ResultsPage";
+import { NotificationProvider, useNotifications } from "./notifications/NotificationContext";
 import { AGENTS, INITIAL_RUNS } from "./mockData";
 import type { Agent, LogLine, RawEventLine, Run, Screen } from "./types";
+import type { PauseOption } from "./notifications/types";
 
 /** Classify a JobEvent / RawEventLine into INFO / WARN / ERROR for the viewer. */
 function eventToLogLine(ev: JobEvent | RawEventLine): LogLine {
@@ -34,7 +36,9 @@ function nowStamp(): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
-export default function App() {
+function AppInner() {
+  const { addNotification, updateRunId, pendingCount } = useNotifications();
+
   const [screen, setScreen] = useState<Screen>("landing");
   const [projects, setProjects] = useState<Project[]>([]);
   const [dataRoot, setDataRoot] = useState<string | null>(null);
@@ -136,6 +140,8 @@ export default function App() {
           const newest = entries.reduce((acc, e) => e.timestamp > acc.timestamp ? e : acc);
           setRuns((rs) => rs.map((r) => r.id === jobId ? { ...r, id: newest.run_id, started: newest.timestamp } : r));
           setCurrentRun((c) => (c && c.id === jobId) ? { ...c, id: newest.run_id, started: newest.timestamp } : c);
+          // Back-fill the FS run_id on any notifications that arrived during the live run.
+          updateRunId(jobId, newest.run_id);
         })
         .catch(() => { /* best-effort — ResultsPage will show its empty state */ });
     }
@@ -254,9 +260,29 @@ export default function App() {
     ws.onmessage = (msg) => {
       try {
         const ev: JobEvent = JSON.parse(msg.data);
-        setLiveLogs((ls) => [...ls, eventToLogLine(ev)]);
-        if (ev.kind === "done") finishRun(jobId, "completed", agent.id);
-        else if (ev.kind === "error") finishRun(jobId, "failed", agent.id);
+        if (ev.kind === "pause") {
+          // Route pause events into the global notification store.
+          // The payload is JSON: { prompt, options }
+          try {
+            const pauseData = JSON.parse(ev.payload) as { prompt: string; options: PauseOption[]; run_id?: string };
+            addNotification({
+              jobId,
+              // run_id from Python lets us match this notification from history pages
+              // (which use the FS run_id) without waiting for finishRun to back-fill it.
+              runId: pauseData.run_id ?? null,
+              agentId: agent.id,
+              timestamp: ev.timestamp,
+              payload: { type: "pause", prompt: pauseData.prompt, options: pauseData.options },
+            });
+          } catch {
+            // malformed pause payload — surface as a log line instead
+            setLiveLogs((ls) => [...ls, { lvl: "WARN", msg: `Pause event received (malformed payload): ${ev.payload}` }]);
+          }
+        } else {
+          setLiveLogs((ls) => [...ls, eventToLogLine(ev)]);
+          if (ev.kind === "done") finishRun(jobId, "completed", agent.id);
+          else if (ev.kind === "error") finishRun(jobId, "failed", agent.id);
+        }
       } catch {
         // ignore malformed frames
       }
@@ -371,6 +397,7 @@ export default function App() {
         }}
         onSwitch={switchProject}
         onExit={exitToLanding}
+        pendingNotifications={pendingCount}
       />
       <main style={{
         flex: 1,
@@ -564,5 +591,13 @@ export default function App() {
         </div>
       </Modal>
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <NotificationProvider>
+      <AppInner />
+    </NotificationProvider>
   );
 }

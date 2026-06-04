@@ -1,6 +1,6 @@
 import React from "react";
 
-type Status = "idle" | "running" | "completed" | "failed" | "soon";
+type Status = "idle" | "running" | "completed" | "failed" | "paused" | "soon";
 
 interface StatusPillProps {
   status: Status;
@@ -8,11 +8,12 @@ interface StatusPillProps {
 }
 
 const STATUS: Record<Status, { label: string; c: string; bg: string }> = {
-  idle:      { label: "Idle",        c: "var(--idle)",    bg: "var(--idle-bg)" },
-  running:   { label: "Running",     c: "var(--info)",    bg: "var(--info-bg)" },
-  completed: { label: "Completed",   c: "var(--success)", bg: "var(--success-bg)" },
-  failed:    { label: "Failed",      c: "var(--error)",   bg: "var(--error-bg)" },
-  soon:      { label: "Coming Soon", c: "var(--text-3)",  bg: "var(--idle-bg)" },
+  idle:      { label: "Idle",        c: "var(--idle)",                       bg: "var(--idle-bg)" },
+  running:   { label: "Running",     c: "var(--info)",                       bg: "var(--info-bg)" },
+  completed: { label: "Completed",   c: "var(--success)",                    bg: "var(--success-bg)" },
+  failed:    { label: "Failed",      c: "var(--error)",                      bg: "var(--error-bg)" },
+  paused:    { label: "Waiting",     c: "var(--warning, #ca8a04)",           bg: "var(--warning-soft, rgba(234,179,8,0.12))" },
+  soon:      { label: "Coming Soon", c: "var(--text-3)",                     bg: "var(--idle-bg)" },
 };
 
 export function StatusPill({ status, mini }: StatusPillProps) {
