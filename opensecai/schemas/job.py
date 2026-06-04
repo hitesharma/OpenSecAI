@@ -21,7 +21,7 @@ class Job(BaseModel):
 class JobEvent(BaseModel):
     """One event in the job's stream — log lines, status changes, etc."""
     job_id: str
-    kind: Literal["log", "status", "error", "done"]
+    kind: Literal["log", "status", "error", "done", "pause"]
     payload: str
     timestamp: str
 

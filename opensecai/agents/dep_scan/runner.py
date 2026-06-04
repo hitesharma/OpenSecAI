@@ -13,7 +13,7 @@ import os
 import re
 import subprocess
 import sys
-from typing import Annotated, Any, Callable, List, Optional, TypedDict
+from typing import Any, Callable, List, Optional, TypedDict
 
 import shutil
 
@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
+from langgraph.types import Command, interrupt
 
 from opensecai.core.paths import agent_run_dir, project_reports_dir, workspaces_root
 
@@ -43,20 +44,16 @@ LogFn = Callable[[str], None]
 
 
 class AgentState(TypedDict, total=False):
-    # Per-run identity / paths
+    # Per-run identity / paths — all plain strings, safe for msgpack checkpointing.
     project: str
     root_dir: str  # project's base dir (holds workspaces/ and reports/)
     repo_path: str
     run_id: str
     run_ts_iso: str
     cwd: str
-
-    # Optional sink for streaming log lines to a JobEvent bus.
-    log_fn: Optional[LogFn]
-
-    # Set by the sidecar when the job is cancelled; each node checks this
-    # before starting work so the run stops at the next node boundary.
-    cancel_event: Optional[Any]
+    # UUID job_id from the sidecar — plain string so LangGraph can pass it
+    # through state safely.
+    job_id: str
 
     # Graph-internal fields
     fixed_vulns: List[dict]
@@ -66,13 +63,29 @@ class AgentState(TypedDict, total=False):
     iterations: int
     current_error_file: str
     claude_session_id: str
+    human_decision: str
+
+
+# ── Runtime sideband ─────────────────────────────────────────────────────────
+# log_fn (closure) and cancel_event (threading.Event) are NOT msgpack-
+# serializable, so they cannot live in AgentState when a checkpointer is
+# active.  They are stored here, keyed by run_id, and looked up by nodes.
+_RUNTIME: dict[str, dict] = {}
+
+
+def set_runtime(run_id: str, log_fn: Optional[LogFn], cancel_event: Optional[Any]) -> None:
+    _RUNTIME[run_id] = {"log_fn": log_fn, "cancel_event": cancel_event}
+
+
+def clear_runtime(run_id: str) -> None:
+    _RUNTIME.pop(run_id, None)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _log(state: AgentState, msg: str, err: bool = False) -> None:
-    """Emit a log line — to the state's log_fn if set, otherwise click.echo."""
-    fn = state.get("log_fn")
+    """Emit a log line — via the runtime log_fn if registered, else click.echo."""
+    fn = _RUNTIME.get(state.get("run_id", ""), {}).get("log_fn")
     if fn is not None:
         try:
             fn(msg)
@@ -129,7 +142,7 @@ def _run_tracked(state: AgentState, cmd: list, **kwargs) -> subprocess.Completed
 
 
 def _check_cancel(state: AgentState) -> None:
-    ev = state.get("cancel_event")
+    ev = _RUNTIME.get(state.get("run_id", ""), {}).get("cancel_event")
     if ev is not None and ev.is_set():
         raise RuntimeError("Run cancelled by user.")
 
@@ -247,6 +260,7 @@ def run_tests_node(state: AgentState) -> dict:
 
     if build_res.returncode != 0:
         _log(state, "❌ Breaking changes detected.")
+        _log(state, f"{build_res.stderr}")
         return {"test_passed": False, "build_logs": build_res.stderr}
 
     _log(state, "✅ Static analysis passed!")
@@ -366,11 +380,74 @@ def claude_code_node(state: AgentState) -> dict:
     return {"iterations": iterations + 1, "claude_session_id": new_session_id}
 
 
+# ── Node 4.5: Wait for Human Decision (LangGraph interrupt) ─────────────────
+def wait_for_decision_node(state: AgentState) -> dict:
+    """Pause the graph and surface a structured prompt to the caller.
+
+    LangGraph interrupt rules applied here:
+    - interrupt() MUST NOT be wrapped in a bare try/except — it works by
+      raising a special internal exception that the runtime catches.
+    - On resume the runtime re-enters this node from the TOP (not from the
+      interrupt() line), so every line above interrupt() runs twice: once
+      before the pause and once before continuing.  Code below interrupt()
+      runs only once — after the human provides input.
+    - The index.json update (above interrupt) is idempotent: setting
+      "paused" twice has no additional effect, so re-entry is safe.
+    - The _log and return statement (below interrupt) run exactly once.
+    - The interrupt payload must be JSON-serializable.
+    """
+    _check_cancel(state)
+
+    # Mark as "paused" so the UI can reflect the correct status before the
+    # user sees the prompt.  Idempotent — safe to run again on re-entry.
+    index_path = os.path.join(_index_dir(state), "index.json")
+    run_id = state["run_id"]
+
+    def _mark_paused(entries: list[dict]) -> None:
+        for entry in entries:
+            if entry.get("run_id") == run_id:
+                entry["status"] = "paused"
+                break
+
+    try:
+        _update_index(index_path, _mark_paused)
+    except Exception:  # noqa: BLE001
+        pass  # never let an index write block the interrupt
+
+    # ── Pause point ──────────────────────────────────────────────────────────
+    # Execution suspends here on the first call.  The runtime persists graph
+    # state via the checkpointer and surfaces the payload to the caller.
+    # On resume (Command(resume=<decision>)), the runtime re-enters from the
+    # top of this node; this call returns the resume value immediately without
+    # pausing again.
+    #
+    # Payload shape:
+    #   "contract" → name used by agent_registry to look up the static
+    #                PauseContract (prompt, options, labels) from contracts.py.
+    #   "context"  → dynamic per-run data merged into the WebSocket "pause"
+    #                event so the frontend can show the actual build output.
+    decision: str = interrupt({
+        "contract": "dep_scan.test_failed",
+        "context": {"build_logs": state.get("build_logs", "")},
+    })
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Everything below runs once — only after the human has provided input.
+    _log(state, f"▶️  Resuming with decision: {decision}")
+    return {"human_decision": decision}
+
+
 # ── Routing ─────────────────────────────────────────────────────────────────
 def route_after_test(state: AgentState) -> str:
     if state.get("test_passed"):
         return "final_scan"
     if state.get("iterations", 0) >= 1:
+        return "final_scan"
+    return "wait_for_decision"
+
+
+def route_after_decision(state: AgentState) -> str:
+    if state.get("human_decision") == "skip_to_final_scan":
         return "final_scan"
     return "claude_code"
 
@@ -479,11 +556,12 @@ def _now_iso() -> str:
 
 
 # ── Build the Pipeline ──────────────────────────────────────────────────────
-def build_workflow():
+def build_workflow(checkpointer=None):
     g = StateGraph(AgentState)
     g.add_node("scan", scan_trivy_node)
     g.add_node("update", update_dependencies_node)
     g.add_node("test", run_tests_node)
+    g.add_node("wait_for_decision", wait_for_decision_node)
     g.add_node("analyze_and_fix", analyze_and_fix_node)
     g.add_node("claude_code", claude_code_node)
     g.add_node("final_scan", final_scan_node)
@@ -493,11 +571,12 @@ def build_workflow():
     g.add_edge("scan", "update")
     g.add_edge("update", "test")
     g.add_conditional_edges("test", route_after_test)
+    g.add_conditional_edges("wait_for_decision", route_after_decision)
     g.add_edge("claude_code", "test")
     g.add_edge("analyze_and_fix", "test")
     g.add_edge("final_scan", "diff_report")
     g.add_edge("diff_report", END)
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
 
 
 def make_initial_state(
@@ -505,12 +584,16 @@ def make_initial_state(
     project: str,
     root_dir: str,
     repo_path: str,
-    log_fn: Optional[LogFn] = None,
+    job_id: str = "",
 ) -> AgentState:
     """Build the AgentState used to invoke() the graph.
 
     root_dir is the project's per-project base path (sibling to workspaces/);
     reports are written under <root_dir>/reports/<project>/<agent>/<run_id>/.
+    job_id is the UUID assigned by the sidecar; empty string in CLI mode.
+
+    Runtime-only objects (log_fn, cancel_event) are registered separately via
+    set_runtime() so the state remains msgpack-serializable for checkpointing.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     return {
@@ -520,8 +603,7 @@ def make_initial_state(
         "run_id": now.strftime("%Y%m%d_%H%M%S"),
         "run_ts_iso": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "cwd": repo_path,
-        "log_fn": log_fn,
-        "cancel_event": None,
+        "job_id": job_id,
         "fixed_vulns": [],
         "affected_vulns": [],
         "build_logs": "",
@@ -529,6 +611,7 @@ def make_initial_state(
         "iterations": 0,
         "current_error_file": "",
         "claude_session_id": "",
+        "human_decision": "",
     }
 
 
@@ -561,8 +644,25 @@ def main() -> None:
 
     click.echo(f"📂 Targeting directory: {repo_path}")
 
-    workflow = build_workflow()
-    workflow.invoke(make_initial_state(project=project, root_dir=root_dir, repo_path=repo_path))
+    from langgraph.checkpoint.memory import MemorySaver
+
+    checkpointer = MemorySaver()
+    initial_state = make_initial_state(project=project, root_dir=root_dir, repo_path=repo_path)
+    run_id = initial_state["run_id"]
+    config = {"configurable": {"thread_id": run_id}}
+    set_runtime(run_id, log_fn=None, cancel_event=None)
+    workflow = build_workflow(checkpointer=checkpointer)
+    try:
+        workflow.invoke(initial_state, config=config)
+
+        # If the graph paused at a breakpoint (no UI in CLI mode), auto-resume
+        # with the default decision so the run completes without human input.
+        graph_state = workflow.get_state(config)
+        if graph_state.next:
+            click.echo("⚠️  Tests failed — no UI in CLI mode, defaulting to 'proceed_claude_code'")
+            workflow.invoke(Command(resume="proceed_claude_code"), config=config)
+    finally:
+        clear_runtime(run_id)
 
 
 if __name__ == "__main__":
