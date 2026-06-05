@@ -4,6 +4,7 @@ import { Icon } from "../components/Icon";
 import { Button } from "../components/ui/Button";
 import { AGENTS } from "../mockData";
 import type { Project } from "../api/client";
+import iconPng from "../../src-tauri/icons/icon.png";
 
 interface LandingPageProps {
   onCreate: () => void;
@@ -37,6 +38,7 @@ export function LandingPage({ onCreate, onSwitch, projects }: LandingPageProps) 
       alignItems: "center",
       justifyContent: "center",
       padding: 24,
+      paddingBottom: "18vh",
       position: "relative",
       overflow: "hidden",
     }}>
@@ -54,7 +56,8 @@ export function LandingPage({ onCreate, onSwitch, projects }: LandingPageProps) 
       }} />
 
       <div style={{ position: "absolute", top: 28, left: 32 }}>
-        <Logo size={26} />
+         <Logo size={26} />
+        {/* <img src={iconPng} alt="OpenSecAI" style={{ width: 32, height: 32, objectFit: "contain" }} /> */}
       </div>
 
       <div style={{
@@ -66,7 +69,7 @@ export function LandingPage({ onCreate, onSwitch, projects }: LandingPageProps) 
         alignItems: "center",
       }}>
         {/* Shield icon */}
-        <div style={{
+        {/* <div style={{
           width: 76,
           height: 76,
           borderRadius: 20,
@@ -76,9 +79,9 @@ export function LandingPage({ onCreate, onSwitch, projects }: LandingPageProps) 
           background: "linear-gradient(150deg, rgba(129,140,248,0.18), rgba(99,102,241,0.06))",
           border: "1px solid rgba(129,140,248,0.28)",
           boxShadow: "0 12px 40px rgba(99,102,241,0.18)",
-        }}>
-          <Icon name="shieldCheck" size={36} stroke={1.6} style={{ color: "var(--accent-bright)" }} />
-        </div>
+        }}> */}
+          <img src={iconPng} alt="OpenSecAI Logo" style={{ width: 350, height: 350, objectFit: "contain" }} />
+        {/* </div> */}
 
         <h1 style={{ fontSize: "var(--text-3xl)", fontWeight: 700, lineHeight: 1.1 }}>
           OpenSec<span style={{ color: "var(--accent-bright)" }}>AI</span>
