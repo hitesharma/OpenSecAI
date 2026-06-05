@@ -1,9 +1,11 @@
 """dep_scan agent — Go dependency vulnerability scan + auto-remediation.
 
-State (project, repo_path, run_id, cwd, log_fn) is threaded through every
-node so concurrent runs from the FastAPI sidecar don't collide on module
-globals. The CLI entrypoint (`opensecai-dep-scan`) builds the initial state
-from env vars; the sidecar builds it from the HTTP request.
+State (project, repo_path, run_id, cwd) is threaded through every node so
+concurrent runs from the FastAPI sidecar don't collide on module globals.
+
+Runtime-only objects (log_fn, cancel_event) are passed via LangGraph's
+context_schema mechanism so they never enter the checkpoint — MemorySaver
+uses msgpack serialization, which cannot handle callables or threading.Event.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
+from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
 
 from opensecai.core.paths import agent_run_dir, project_reports_dir, workspaces_root
@@ -38,9 +41,14 @@ for p in ["/opt/homebrew/bin", "/usr/local/bin", os.path.expanduser("~/.local/bi
 
 AGENT_NAME = "dep_scan"
 
-
 # Sync log callback type. None → fall back to click.echo (CLI mode).
 LogFn = Callable[[str], None]
+
+
+class RunContext(TypedDict, total=False):
+    """Runtime-only context injected per invoke() — never serialized into the checkpoint."""
+    log_fn: Optional[LogFn]
+    cancel_event: Optional[Any]
 
 
 class AgentState(TypedDict, total=False):
@@ -66,26 +74,11 @@ class AgentState(TypedDict, total=False):
     human_decision: str
 
 
-# ── Runtime sideband ─────────────────────────────────────────────────────────
-# log_fn (closure) and cancel_event (threading.Event) are NOT msgpack-
-# serializable, so they cannot live in AgentState when a checkpointer is
-# active.  They are stored here, keyed by run_id, and looked up by nodes.
-_RUNTIME: dict[str, dict] = {}
-
-
-def set_runtime(run_id: str, log_fn: Optional[LogFn], cancel_event: Optional[Any]) -> None:
-    _RUNTIME[run_id] = {"log_fn": log_fn, "cancel_event": cancel_event}
-
-
-def clear_runtime(run_id: str) -> None:
-    _RUNTIME.pop(run_id, None)
-
-
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _log(state: AgentState, msg: str, err: bool = False) -> None:
-    """Emit a log line — via the runtime log_fn if registered, else click.echo."""
-    fn = _RUNTIME.get(state.get("run_id", ""), {}).get("log_fn")
+def _log(runtime: Runtime[[RunContext]], msg: str, err: bool = False) -> None:
+    """Emit a log line via the runtime log_fn if set, else click.echo."""
+    fn = runtime.context.get("log_fn") if runtime is not None else None
     if fn is not None:
         try:
             fn(msg)
@@ -141,8 +134,8 @@ def _run_tracked(state: AgentState, cmd: list, **kwargs) -> subprocess.Completed
     return result
 
 
-def _check_cancel(state: AgentState) -> None:
-    ev = _RUNTIME.get(state.get("run_id", ""), {}).get("cancel_event")
+def _check_cancel(runtime: Runtime[RunContext]) -> None:
+    ev = runtime.context.get("cancel_event") if runtime is not None else None
     if ev is not None and ev.is_set():
         raise RuntimeError("Run cancelled by user.")
 
@@ -160,8 +153,8 @@ def _update_index(index_path: str, updater) -> None:
 
 
 # ── Node 1: Scan with Trivy ─────────────────────────────────────────────────
-def scan_trivy_node(state: AgentState) -> dict:
-    _check_cancel(state)
+def scan_trivy_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
+    _check_cancel(runtime)
     index_path = os.path.join(_index_dir(state), "index.json")
     _update_index(index_path, lambda entries: entries.append({
         "run_id": state["run_id"],
@@ -170,7 +163,7 @@ def scan_trivy_node(state: AgentState) -> dict:
         "summary": {},
     }))
 
-    _log(state, "🔍 Running Trivy vulnerability scan...")
+    _log(runtime, "🔍 Running Trivy vulnerability scan...")
     try:
         env = os.environ.copy()
         env["DOCKER_CONFIG"] = "/tmp"
@@ -183,7 +176,7 @@ def scan_trivy_node(state: AgentState) -> dict:
         report_path = os.path.join(_run_dir(state), "start.json")
         with open(report_path, "w") as f:
             f.write(result.stdout)
-        _log(state, f"💾 Saved scan report to: {report_path}")
+        _log(runtime, f"💾 Saved scan report to: {report_path}")
 
         data = json.loads(result.stdout)
         fixed_vulns: list[dict] = []
@@ -202,30 +195,30 @@ def scan_trivy_node(state: AgentState) -> dict:
                 else:
                     affected_vulns.append(entry)
 
-        _log(state, f"Found {len(fixed_vulns) + len(affected_vulns)} vulnerability records.")
+        _log(runtime, f"Found {len(fixed_vulns) + len(affected_vulns)} vulnerability records.")
         return {"fixed_vulns": fixed_vulns, "affected_vulns": affected_vulns, "iterations": 0}
     except Exception as e:  # noqa: BLE001
-        _log(state, f"❌ Trivy scan failed: {e}", err=True)
+        _log(runtime, f"❌ Trivy scan failed: {e}", err=True)
         return {"fixed_vulns": [], "affected_vulns": [], "iterations": 0}
 
 
 # ── Node 2: Update Dependencies ─────────────────────────────────────────────
-def update_dependencies_node(state: AgentState) -> dict:
-    _check_cancel(state)
+def update_dependencies_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
+    _check_cancel(runtime)
     fixed_vulns = state.get("fixed_vulns", [])
     affected_vulns = state.get("affected_vulns", [])
 
     if not fixed_vulns and not affected_vulns:
-        _log(state, "No vulnerabilities found to update.")
+        _log(runtime, "No vulnerabilities found to update.")
         return {}
 
     if affected_vulns:
-        _log(state, f"⚠️  {len(affected_vulns)} affected vulnerabilities have no upstream fix yet — skipping.")
+        _log(runtime, f"⚠️  {len(affected_vulns)} affected vulnerabilities have no upstream fix yet — skipping.")
 
     if not fixed_vulns:
         return {}
 
-    _log(state, f"Found fix for {len(fixed_vulns)} vulnerabilities")
+    _log(runtime, f"Found fix for {len(fixed_vulns)} vulnerabilities")
 
     # Deduplicate by package — keep last seen version
     seen: dict[str, str] = {}
@@ -235,57 +228,57 @@ def update_dependencies_node(state: AgentState) -> dict:
             seen[pkg] = version
 
     cwd = _cwd(state)
-    _log(state, "🧹 Tidying go.mod (pre-upgrade)...")
+    _log(runtime, "🧹 Tidying go.mod (pre-upgrade)...")
     subprocess.run(["go", "mod", "tidy"], capture_output=True, cwd=cwd)
 
-    _log(state, f"🆙 Upgrading {len(seen)} Go package(s) to their fixed versions...")
+    _log(runtime, f"🆙 Upgrading {len(seen)} Go package(s) to their fixed versions...")
     for pkg, version in seen.items():
         go_version = version if version.startswith("v") else f"v{version}"
         target = f"{pkg}@{go_version}"
-        _log(state, f"  -> go get {target}")
+        _log(runtime, f"  -> go get {target}")
         res = subprocess.run(["go", "get", target], capture_output=True, text=True, cwd=cwd)
         if res.returncode != 0:
-            _log(state, f"  ⚠️  Failed to upgrade {target}: {res.stderr.strip()}", err=True)
+            _log(runtime, f"  ⚠️  Failed to upgrade {target}: {res.stderr.strip()}", err=True)
 
     return {}
 
 
 # ── Node 3: Test and Verify Build ───────────────────────────────────────────
-def run_tests_node(state: AgentState) -> dict:
-    _check_cancel(state)
+def run_tests_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
+    _check_cancel(runtime)
     cwd = _cwd(state)
-    _log(state, "🛠️ Performing static analysis of codebase...")
+    _log(runtime, "🛠️ Performing static analysis of codebase...")
     subprocess.run(["go", "mod", "tidy"], capture_output=True, cwd=cwd)
     build_res = _run_tracked(state, ["go", "vet", "./..."], capture_output=True, text=True, cwd=cwd)
 
     if build_res.returncode != 0:
-        _log(state, "❌ Breaking changes detected.")
-        _log(state, f"{build_res.stderr}")
+        _log(runtime, "❌ Breaking changes detected.")
+        _log(runtime, f"{build_res.stderr}")
         return {"test_passed": False, "build_logs": build_res.stderr}
 
-    _log(state, "✅ Static analysis passed!")
+    _log(runtime, "✅ Static analysis passed!")
     return {"test_passed": True, "build_logs": ""}
 
 
 # ── Node 4: LLM Self-Healing ────────────────────────────────────────────────
-def analyze_and_fix_node(state: AgentState) -> dict:
-    _check_cancel(state)
+def analyze_and_fix_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
+    _check_cancel(runtime)
     logs = state.get("build_logs", "")
     iterations = state.get("iterations", 0)
     cwd = _cwd(state)
 
-    _log(state, f"🤖 Agent fixing breaking changes (Attempt {iterations + 1}/3)...")
+    _log(runtime, f"🤖 Agent fixing breaking changes (Attempt {iterations + 1}/3)...")
 
     match = re.search(r"(([a-zA-Z0-9_\-]+/\#)?([a-zA-Z0-9_\-\.\/]+)\.go):(\d+):", logs)
     if not match:
-        _log(state, "Could not determine file path from error logs. Aborting.")
+        _log(runtime, "Could not determine file path from error logs. Aborting.")
         return {"iterations": iterations + 1}
 
     rel_path = match.group(1)
     file_path = os.path.join(cwd, rel_path)
 
     if not os.path.exists(file_path):
-        _log(state, f"File not found locally: {file_path}")
+        _log(runtime, f"File not found locally: {file_path}")
         return {"iterations": iterations + 1}
 
     with open(file_path, "r") as f:
@@ -312,13 +305,13 @@ def analyze_and_fix_node(state: AgentState) -> dict:
     with open(file_path, "w") as f:
         f.write(fixed_code)
 
-    _log(state, f"✏️ Patched breaking signature in {rel_path}")
+    _log(runtime, f"✏️ Patched breaking signature in {rel_path}")
     return {"iterations": iterations + 1}
 
 
 # ── Node 5: Claude Code Agent ───────────────────────────────────────────────
-def claude_code_node(state: AgentState) -> dict:
-    _check_cancel(state)
+def claude_code_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
+    _check_cancel(runtime)
     logs = state.get("build_logs", "")
     affected_vulns = state.get("affected_vulns", [])
     iterations = state.get("iterations", 0)
@@ -326,9 +319,9 @@ def claude_code_node(state: AgentState) -> dict:
     cwd = _cwd(state)
 
     if session_id:
-        _log(state, f"🤖 Resuming Claude Code session {session_id} (Attempt {iterations + 1})...")
+        _log(runtime, f"🤖 Resuming Claude Code session {session_id} (Attempt {iterations + 1})...")
     else:
-        _log(state, f"🤖 Launching new Claude Code session (Attempt {iterations + 1})...")
+        _log(runtime, f"🤖 Launching new Claude Code session (Attempt {iterations + 1})...")
 
     prompt = "Review the codebase and fix any compilation errors or test failures."
     if logs:
@@ -342,7 +335,7 @@ def claude_code_node(state: AgentState) -> dict:
 
     model = os.environ.get("CLAUDE_MODEL", "haiku")
     effort = os.environ.get("CLAUDE_EFFORT", "low")
-    _log(state, f"using model: {model} with effort: {effort}")
+    _log(runtime, f"using model: {model} with effort: {effort}")
     base_cmd = ["claude", "--model", model, "--effort", effort,
                 "--permission-mode", "auto", "--output-format", "json"]
     cmd = base_cmd + (["--resume", session_id, prompt] if session_id else [prompt])
@@ -350,15 +343,15 @@ def claude_code_node(state: AgentState) -> dict:
     new_session_id = session_id
     pid_path = os.path.join(_run_dir(state), "active_pid")
     try:
-        _log(state, f"running cmd: {' '.join(cmd)}")
-        _log(state, "--- Claude Code Output ---")
+        _log(runtime, f"running cmd: {' '.join(cmd)}")
+        _log(runtime, "--- Claude Code Output ---")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd)
         with open(pid_path, "w") as f:
             f.write(str(proc.pid))
         lines: list[str] = []
         assert proc.stdout is not None
         for line in proc.stdout:
-            _log(state, line.rstrip("\n"))
+            _log(runtime, line.rstrip("\n"))
             lines.append(line)
         proc.wait()
         stdout = "".join(lines)
@@ -366,11 +359,11 @@ def claude_code_node(state: AgentState) -> dict:
             output = json.loads(stdout)
             if not session_id and output.get("session_id"):
                 new_session_id = output["session_id"]
-                _log(state, f"📌 New Claude Code session created: {new_session_id}")
+                _log(runtime, f"📌 New Claude Code session created: {new_session_id}")
         except json.JSONDecodeError:
             pass
     except Exception as e:  # noqa: BLE001
-        _log(state, f"❌ Failed to run Claude Code: {e}", err=True)
+        _log(runtime, f"❌ Failed to run Claude Code: {e}", err=True)
     finally:
         try:
             os.remove(pid_path)
@@ -381,7 +374,7 @@ def claude_code_node(state: AgentState) -> dict:
 
 
 # ── Node 4.5: Wait for Human Decision (LangGraph interrupt) ─────────────────
-def wait_for_decision_node(state: AgentState) -> dict:
+def wait_for_decision_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
     """Pause the graph and surface a structured prompt to the caller.
 
     LangGraph interrupt rules applied here:
@@ -396,7 +389,7 @@ def wait_for_decision_node(state: AgentState) -> dict:
     - The _log and return statement (below interrupt) run exactly once.
     - The interrupt payload must be JSON-serializable.
     """
-    _check_cancel(state)
+    _check_cancel(runtime)
 
     # Mark as "paused" so the UI can reflect the correct status before the
     # user sees the prompt.  Idempotent — safe to run again on re-entry.
@@ -433,7 +426,7 @@ def wait_for_decision_node(state: AgentState) -> dict:
     # ─────────────────────────────────────────────────────────────────────────
 
     # Everything below runs once — only after the human has provided input.
-    _log(state, f"▶️  Resuming with decision: {decision}")
+    _log(runtime, f"▶️  Resuming with decision: {decision}")
     return {"human_decision": decision}
 
 
@@ -453,9 +446,9 @@ def route_after_decision(state: AgentState) -> str:
 
 
 # ── Node 6: Final Scan ──────────────────────────────────────────────────────
-def final_scan_node(state: AgentState) -> dict:
-    _check_cancel(state)
-    _log(state, "🔍 Running final Trivy scan...")
+def final_scan_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
+    _check_cancel(runtime)
+    _log(runtime, "🔍 Running final Trivy scan...")
     try:
         env = os.environ.copy()
         env["DOCKER_CONFIG"] = "/tmp"
@@ -468,16 +461,16 @@ def final_scan_node(state: AgentState) -> dict:
         report_path = os.path.join(_run_dir(state), "end.json")
         with open(report_path, "w") as f:
             f.write(result.stdout)
-        _log(state, f"💾 Final scan report saved to: {report_path}")
+        _log(runtime, f"💾 Final scan report saved to: {report_path}")
     except Exception as e:  # noqa: BLE001
-        _log(state, f"❌ Final Trivy scan failed: {e}", err=True)
+        _log(runtime, f"❌ Final Trivy scan failed: {e}", err=True)
     return {}
 
 
 # ── Node 7: Diff Report ─────────────────────────────────────────────────────
-def diff_report_node(state: AgentState) -> dict:
-    _check_cancel(state)
-    _log(state, "📊 Generating vulnerability diff report...")
+def diff_report_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
+    _check_cancel(runtime)
+    _log(runtime, "📊 Generating vulnerability diff report...")
     run_dir = _run_dir(state)
     start_path = os.path.join(run_dir, "start.json")
     end_path = os.path.join(run_dir, "end.json")
@@ -492,7 +485,7 @@ def diff_report_node(state: AgentState) -> dict:
         start_vulns = load_vulns(start_path)
         end_vulns = load_vulns(end_path)
     except FileNotFoundError as e:
-        _log(state, f"❌ Cannot diff — missing report file: {e}", err=True)
+        _log(runtime, f"❌ Cannot diff — missing report file: {e}", err=True)
         return {}
 
     start_df = pl.DataFrame({"id": [v.get("VulnerabilityID") for v in start_vulns]})
@@ -523,9 +516,9 @@ def diff_report_node(state: AgentState) -> dict:
 
     _update_index(index_path, _complete)
 
-    _log(state, f"fixed: {len(diff['fixed'])}  |  new: {len(diff['new'])}  |  persisted: {len(diff['persisted'])}")
-    _log(state, f"💾 Diff saved to: {diff_path}")
-    _log(state, f"📋 Index updated: {index_path}")
+    _log(runtime, f"fixed: {len(diff['fixed'])}  |  new: {len(diff['new'])}  |  persisted: {len(diff['persisted'])}")
+    _log(runtime, f"💾 Diff saved to: {diff_path}")
+    _log(runtime, f"📋 Index updated: {index_path}")
     return {}
 
 
@@ -557,7 +550,7 @@ def _now_iso() -> str:
 
 # ── Build the Pipeline ──────────────────────────────────────────────────────
 def build_workflow(checkpointer=None):
-    g = StateGraph(AgentState)
+    g = StateGraph(AgentState, context_schema=RunContext)
     g.add_node("scan", scan_trivy_node)
     g.add_node("update", update_dependencies_node)
     g.add_node("test", run_tests_node)
@@ -592,8 +585,8 @@ def make_initial_state(
     reports are written under <root_dir>/reports/<project>/<agent>/<run_id>/.
     job_id is the UUID assigned by the sidecar; empty string in CLI mode.
 
-    Runtime-only objects (log_fn, cancel_event) are registered separately via
-    set_runtime() so the state remains msgpack-serializable for checkpointing.
+    Runtime-only objects (log_fn, cancel_event) are passed via context= on
+    each invoke() call so they never enter the msgpack-serialized checkpoint.
     """
     now = datetime.datetime.now(datetime.timezone.utc)
     return {
@@ -650,19 +643,20 @@ def main() -> None:
     initial_state = make_initial_state(project=project, root_dir=root_dir, repo_path=repo_path)
     run_id = initial_state["run_id"]
     config = {"configurable": {"thread_id": run_id}}
-    set_runtime(run_id, log_fn=None, cancel_event=None)
+    ctx = {"log_fn": None, "cancel_event": None}
     workflow = build_workflow(checkpointer=checkpointer)
     try:
-        workflow.invoke(initial_state, config=config)
+        workflow.invoke(initial_state, config=config, context=ctx)
 
         # If the graph paused at a breakpoint (no UI in CLI mode), auto-resume
         # with the default decision so the run completes without human input.
         graph_state = workflow.get_state(config)
         if graph_state.next:
             click.echo("⚠️  Tests failed — no UI in CLI mode, defaulting to 'proceed_claude_code'")
-            workflow.invoke(Command(resume="proceed_claude_code"), config=config)
-    finally:
-        clear_runtime(run_id)
+            workflow.invoke(Command(resume="proceed_claude_code"), config=config, context=ctx)
+    except Exception:
+        cleanup_run(initial_state)
+        raise
 
 
 if __name__ == "__main__":

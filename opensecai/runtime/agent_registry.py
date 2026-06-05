@@ -17,6 +17,10 @@ asyncio.Event.  The frontend POSTs to /jobs/{id}/decision →
 PauseManager.resolve() fires the on_resume callback which sets the
 asyncio.Event.  _run_dep_scan then resumes the graph with
 Command(resume=<decision>).
+
+Runtime context (log_fn, cancel_event) is passed via LangGraph's context=
+parameter on each invoke() call.  This keeps non-serializable objects out of
+AgentState so MemorySaver's msgpack checkpointing never sees them.
 """
 from __future__ import annotations
 
@@ -62,9 +66,7 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
     import traceback as _tb
 
     import opensecai.agents.dep_scan.contracts  # noqa: F401 — side-effect registration
-    from opensecai.agents.dep_scan.runner import (
-        build_workflow, cleanup_run, make_initial_state, set_runtime, clear_runtime,
-    )
+    from opensecai.agents.dep_scan.runner import build_workflow, cleanup_run, make_initial_state
     from opensecai.core.paths import agent_run_dir
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.types import Command
@@ -107,15 +109,16 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
     pause_mgr = get_pause_manager()
     workflow = build_workflow(checkpointer=checkpointer)
 
-    # ── Phase 2: first invoke (runs until END or interrupt) ──────────────────
-    # Register non-serializable runtime objects in the sideband so they stay
-    # out of AgentState (MemorySaver uses msgpack; functions/Events can't be
-    # serialized).
-    set_runtime(run_id, log_fn, cancel_event)
+    # Runtime context passed per-invoke so non-serializable objects (log_fn,
+    # cancel_event) never enter the MemorySaver checkpoint.  Both invoke calls
+    # receive the same context so nodes always have access regardless of whether
+    # this is the first run or a post-interrupt resume.
+    ctx = {"log_fn": log_fn, "cancel_event": cancel_event}
 
+    # ── Phase 2: first invoke (runs until END or interrupt) ──────────────────
     def _invoke_first() -> None:
         try:
-            workflow.invoke(initial_state, config=config)
+            workflow.invoke(initial_state, config=config, context=ctx)
         except Exception as e:  # noqa: BLE001
             log_fn(f"❌ dep_scan node failed: {type(e).__name__}: {e}")
             log_fn(_tb.format_exc())
@@ -125,11 +128,9 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
         await asyncio.to_thread(_invoke_first)
     except asyncio.CancelledError:
         cancel_event.set()
-        clear_runtime(run_id)
         await asyncio.to_thread(cleanup_run, initial_state)
         raise
     except Exception:
-        clear_runtime(run_id)
         await asyncio.to_thread(cleanup_run, initial_state)
         raise
 
@@ -145,10 +146,10 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
         raw = all_interrupts[0].value
         if isinstance(raw, dict):
             contract_name: str = raw["contract"]
-            context: dict = raw.get("context", {})
+            interrupt_context: dict = raw.get("context", {})
         else:
             contract_name = str(raw)
-            context = {}
+            interrupt_context = {}
 
         contract = get_contract(contract_name)
 
@@ -160,9 +161,7 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
             loop.call_soon_threadsafe(resume_event.set)
 
         pause_mgr.register_pause(job_id, contract.prompt, contract.option_values(), on_resume)
-        # run_id lets the frontend match this notification to the FS run entry
-        # when the user navigates from AgentRunHistoryPage (which uses the FS run_id).
-        ws_payload = {**contract.to_ws_payload(), **context, "run_id": run_id}
+        ws_payload = {**contract.to_ws_payload(), **interrupt_context}
         await emit("pause", _json.dumps(ws_payload))
 
         try:
@@ -179,7 +178,7 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
         # ── Phase 4: resume graph with the user's decision ───────────────────
         def _invoke_resume() -> None:
             try:
-                workflow.invoke(Command(resume=decision), config=config)
+                workflow.invoke(Command(resume=decision), config=config, context=ctx)
             except Exception as e:  # noqa: BLE001
                 log_fn(f"❌ dep_scan node failed on resume: {type(e).__name__}: {e}")
                 log_fn(_tb.format_exc())
@@ -189,15 +188,12 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
             await asyncio.to_thread(_invoke_resume)
         except asyncio.CancelledError:
             cancel_event.set()
-            clear_runtime(run_id)
             await asyncio.to_thread(cleanup_run, initial_state)
             raise
         except Exception:
-            clear_runtime(run_id)
             await asyncio.to_thread(cleanup_run, initial_state)
             raise
 
-    clear_runtime(run_id)
     _write_event("done", "ok")
     await emit("log", "✅ dep_scan completed")
 
