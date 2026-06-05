@@ -512,6 +512,34 @@ function AppInner() {
                 return;
               }
 
+              // Paused run: still alive in the sidecar, waiting for a decision.
+              // Look up the live job UUID so run.id matches notification.jobId,
+              // which makes the pause overlay render in LogViewerPage.
+              if (entry.status === "paused") {
+                const r: Run = {
+                  id: entry.run_id, // temporary; replaced by job UUID below
+                  agent: historyAgent,
+                  status: "running",
+                  started: entry.timestamp,
+                  duration: "—",
+                };
+                setCurrentRun(r);
+                setScreen("logs");
+                api.getRunEvents(rootDir, project, historyAgent, entry.run_id).then((evs) => {
+                  setLiveLogs(evs.length > 0 ? evs.map(eventToLogLine) : []);
+                }).catch(() => { setLiveLogs([]); });
+                api.listJobs().then((jobs) => {
+                  const job = jobs.find(
+                    (j) => j.agent === historyAgent && j.project === project && j.status === "running",
+                  );
+                  if (job) {
+                    // Update run.id to the UUID so n.jobId === run.id matches the notification.
+                    setCurrentRun((prev) => prev?.id === entry.run_id ? { ...prev, id: job.id } : prev);
+                  }
+                }).catch(() => {});
+                return;
+              }
+
               // Past run — load static transcript.
               const r: Run = {
                 id: entry.run_id,

@@ -49,9 +49,9 @@ export function LogViewerPage({ run, lines, running, onBack, onResults }: LogVie
       (n.jobId === run?.id || n.runId === run?.id)
   ) ?? null;
 
-  // Reset local close state whenever a new/different notification appears.
+  // Reset local close state whenever a new/different notification appears or when the run changes.
   const pauseNotifId = pauseNotification?.id ?? null;
-  React.useEffect(() => { setOverlayDismissed(false); }, [pauseNotifId]);
+  React.useEffect(() => { setOverlayDismissed(false); }, [pauseNotifId, run?.id]);
 
   const handleDecision = async (notifId: string, decision: string) => {
     setResolvingId(decision);
