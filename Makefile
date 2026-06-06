@@ -10,7 +10,8 @@ install:
 ## run: run the default (dep_scan) agent locally — requires PROJECT env var
 run: run-dep-scan
 
-run-dev: ENV=dev npm run tauri dev
+run-dev:
+	cd desktop && ENV=dev npm run tauri dev
 
 ## run-dep-scan: run the dep_scan agent via the root shim
 run-dep-scan:
