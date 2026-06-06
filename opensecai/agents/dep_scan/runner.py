@@ -440,6 +440,21 @@ def route_after_test(state: AgentState) -> str:
 
 
 def route_after_decision(state: AgentState) -> str:
+    # Mark as "paused" so the UI can reflect the correct status before the
+    # user sees the prompt.  Idempotent — safe to run again on re-entry.
+    index_path = os.path.join(_index_dir(state), "index.json")
+    run_id = state["run_id"]
+
+    def _mark_paused(entries: list[dict]) -> None:
+        for entry in entries:
+            if entry.get("run_id") == run_id:
+                entry["status"] = "running"
+                break
+
+    try:
+        _update_index(index_path, _mark_paused)
+    except Exception:  # noqa: BLE001
+        pass  # never let an index write block the interrupt
     if state.get("human_decision") == "skip_to_final_scan":
         return "final_scan"
     return "claude_code"
