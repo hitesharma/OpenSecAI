@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, RunEvent};
 
+use sidecar::SIDECAR_PGID;
+
 static QUIT_CONFIRMED: AtomicBool = AtomicBool::new(false);
 
 use sidecar::SidecarHandle;
@@ -197,6 +199,21 @@ fn quit_app(app: tauri::AppHandle) {
 pub fn run() {
     let _ = dotenvy::dotenv();
 
+    // SIGINT / SIGTERM (Ctrl-C from terminal, `kill <pid>`) bypass Tauri's
+    // RunEvent::Exit, so we register a handler here that does the same cleanup
+    // before terminating the process.
+    let _ = ctrlc::set_handler(|| {
+        #[cfg(unix)]
+        {
+            let pgid = SIDECAR_PGID.load(Ordering::SeqCst);
+            if pgid > 0 {
+                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            }
+        }
+        sidecar::kill_by_port(8765);
+        std::process::exit(0);
+    });
+
     tauri::Builder::default()
         .manage(SidecarHandle(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![read_agent_index, read_run_diff, read_run_events, delete_agent_run, restart_sidecar, quit_app])
@@ -229,10 +246,13 @@ pub fn run() {
                     let _ = win.emit("quit-requested", ());
                 }
             }
-            // Reached only via the quit_app command (user confirmed in dialog).
+            // Reached on every exit path — acts as a deferred cleanup guarantee.
             RunEvent::Exit => {
                 let state: tauri::State<'_, SidecarHandle> = app_handle.state();
                 sidecar::kill(&state);
+                // Belt-and-suspenders: kill anything still holding the port,
+                // even if the child was orphaned or the handle was already taken.
+                sidecar::kill_by_port(8765);
             }
             _ => {}
         });

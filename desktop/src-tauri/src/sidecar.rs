@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, Ordering};
 use tauri::Manager;
 
 #[cfg(unix)]
@@ -18,6 +19,10 @@ use libc;
 
 /// Holds the running sidecar Child so we can kill it on shutdown.
 pub struct SidecarHandle(pub Mutex<Option<Child>>);
+
+/// Process group ID of the live sidecar; 0 means none running.
+/// Written on spawn, read by the Ctrl-C signal handler.
+pub static SIDECAR_PGID: AtomicI32 = AtomicI32::new(0);
 
 const DEFAULT_PORT: &str = "8765";
 
@@ -97,8 +102,15 @@ pub fn spawn(app: &tauri::AppHandle) -> Result<Child, String> {
         }
     }
 
-    cmd.spawn()
-        .map_err(|e| format!("failed to spawn sidecar `{program}`: {e}"))
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn sidecar `{program}`: {e}"))?;
+
+    // Record PGID so the Ctrl-C signal handler can kill the group.
+    #[cfg(unix)]
+    SIDECAR_PGID.store(child.id() as i32, Ordering::SeqCst);
+
+    Ok(child)
 }
 
 pub fn kill(handle: &SidecarHandle) {
@@ -116,6 +128,46 @@ pub fn kill(handle: &SidecarHandle) {
             let _ = child.kill();
 
             let _ = child.wait();
+            SIDECAR_PGID.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Kill any process still holding `port`, regardless of how it got there.
+/// Called as a deferred safety net on every exit path.
+pub fn kill_by_port(port: u16) {
+    #[cfg(unix)]
+    {
+        // lsof -ti :PORT prints one PID per line for every process bound to the port.
+        let Ok(out) = std::process::Command::new("lsof")
+            .args(["-ti", &format!(":{port}")])
+            .output()
+        else {
+            return;
+        };
+        for pid_str in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            if let Ok(pid) = pid_str.trim().parse::<libc::pid_t>() {
+                eprintln!("[sidecar] kill_by_port: SIGKILL pid {pid} on port {port}");
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // netstat -ano lists listening ports with their PIDs.
+        let Ok(out) = std::process::Command::new("netstat").args(["-ano"]).output() else {
+            return;
+        };
+        let port_marker = format!(":{port}");
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if line.contains(&port_marker) && line.to_uppercase().contains("LISTENING") {
+                if let Some(pid_str) = line.split_whitespace().last() {
+                    eprintln!("[sidecar] kill_by_port: taskkill pid {pid_str} on port {port}");
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", pid_str, "/F"])
+                        .output();
+                }
+            }
         }
     }
 }
