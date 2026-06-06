@@ -49,3 +49,12 @@ opensecai.db
 opensecai.db-journal
 opensecai.db-wal
 opensecai.db-shm
+
+# PyInstaller build outputs and spec files
+build/
+dist/
+*.spec
+
+# Compiled sidecar binary
+desktop/src-tauri/opensecai-api
+

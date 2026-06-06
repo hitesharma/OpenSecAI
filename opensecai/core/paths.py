@@ -5,7 +5,7 @@ There are two distinct "roots" in the system:
   • data_root()  — the global app-data dir holding opensecai.db, settings,
     and (legacy) workspaces/reports. Resolves to:
         ENV=dev   → <repo-root>/
-        ENV=prod  → platform app-data dir for io.coredge.opensecai
+        ENV=prod  → platform app-data dir for hitesharma.opensecai
     This is the *only* path derived from ENV / OPENSECAI_DATA_DIR.
 
   • <project.root_dir> — each Project record carries its own user-chosen
@@ -26,7 +26,7 @@ import sys
 from functools import lru_cache
 from pathlib import Path
 
-APP_IDENTIFIER = "io.coredge.opensecai"
+APP_IDENTIFIER = "hitesharma.opensecai"
 
 
 def _platform_app_data_dir() -> Path:

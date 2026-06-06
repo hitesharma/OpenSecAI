@@ -333,7 +333,7 @@ def claude_code_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
             "Please rewrite the affected code to mitigate or remove the dependency."
         )
 
-    model = os.environ.get("CLAUDE_MODEL", "haiku")
+    model = os.environ.get("CLAUDE_MODEL", "sonnet")
     effort = os.environ.get("CLAUDE_EFFORT", "low")
     _log(runtime, f"using model: {model} with effort: {effort}")
     base_cmd = ["claude", "--model", model, "--effort", effort,

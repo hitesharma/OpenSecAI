@@ -1,7 +1,12 @@
 UV     := uv
 PKG    := opensecai
 
-.PHONY: install run run-dep-scan api codegen lint format typecheck clean help
+.PHONY: setup install run run-dep-scan api codegen lint format typecheck clean help build
+
+## setup: run the system setup script (installs system libraries, Node, Rust, Trivy)
+setup:
+	chmod +x setup.sh
+	./setup.sh
 
 ## install: create venv and install all dependencies from lockfile
 install:
@@ -9,6 +14,11 @@ install:
 
 ## run: run the default (dep_scan) agent locally — requires PROJECT env var
 run: run-dep-scan
+
+## build: run the unified production build script (compile sidecar + build tauri package)
+build:
+	chmod +x build.sh
+	./build.sh
 
 run-dev:
 	cd desktop && ENV=dev npm run tauri dev

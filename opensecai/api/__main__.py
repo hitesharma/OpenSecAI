@@ -27,14 +27,27 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s — %(message)s",
         datefmt="%H:%M:%S",
     )
-    uvicorn.run(
-        "opensecai.api.app:app",
-        host=host,
-        port=port,
-        log_level=level_name.lower(),
-        reload=os.environ.get("ENV", "prod").lower() == "dev"
-        and os.environ.get("OPENSECAI_API_RELOAD", "0") == "1",
-    )
+    dev_mode = os.environ.get("ENV", "prod").lower() == "dev"
+    reload_mode = os.environ.get("OPENSECAI_API_RELOAD", "0") == "1"
+
+    if dev_mode and reload_mode:
+        uvicorn.run(
+            "opensecai.api.app:app",
+            host=host,
+            port=port,
+            log_level=level_name.lower(),
+            reload=True,
+        )
+    else:
+        # Import directly to ensure PyInstaller bundles the app module,
+        # and uvicorn doesn't fail on dynamic import in the frozen binary.
+        from opensecai.api.app import app
+        uvicorn.run(
+            app,
+            host=host,
+            port=port,
+            log_level=level_name.lower(),
+        )
 
 
 if __name__ == "__main__":
