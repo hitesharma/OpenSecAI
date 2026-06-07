@@ -15,7 +15,6 @@
   <a href="https://tauri.app/"><img src="https://img.shields.io/badge/Tauri-Desktop-orange.svg" alt="Tauri"></a>
   <a href="https://github.com/langchain-ai/langgraph"><img src="https://img.shields.io/badge/LangGraph-Agentic-green.svg" alt="LangGraph"></a>
   <a href="https://github.com/hitesharma/OpenSecAI/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/platforms-amd64%20%7C%20arm64-lightgrey?style=flat-square" alt="Platforms" />
 </p>
 
 
@@ -145,44 +144,67 @@ Make sure you have the following installed on your machine:
 - **Go (Golang)**: Required (the tool currently supports Go projects only)
 - **Trivy**: Vulnerability scanner (required for `dep_scan`)
 
-### Setup Environment
+### Setup Environment & Quick Start
 
-#### 🐧 Linux Quick Start (Automated Setup)
-If you are running in a Debian/Ubuntu-based Linux environment, you can run the automated [setup.sh](https://github.com/hitesharma/OpenSecAI/blob/main/setup.sh) script to automatically verify and install all system dependencies (including Tauri dependencies, Node.js, Rust, Trivy, and `uv`), sync the Python environment, and install frontend node modules:
+Start by cloning the repository and entering the project directory:
+
 ```bash
-chmod +x setup.sh
-./setup.sh
+git clone https://github.com/hitesharma/OpenSecAI
+cd OpenSecAI
 ```
 
-#### 🛠️ Manual Setup
-1. Clone the repository and navigate to the project root:
-   ```bash
-   git clone https://github.com/hitesharma/OpenSecAI
-   cd OpenSecAI
-   ```
+Next, choose **one** of the options below to install dependencies:
 
-2. Copy the environment template and set up your keys:
-   ```bash
-   cp .env.example .env
-   # Edit .env and configure your OPENAI_API_KEY / ANTHROPIC_API_KEY
-   ```
+#### Option A: 🐧 Linux Quick Start (Automated Setup)
+If you are running on a Debian/Ubuntu-based Linux environment, you can run our automated script to verify and install all system prerequisites, Node.js, Rust, Trivy, and `uv`, sync the Python virtual environment, and install the frontend packages:
+```bash
+make setup
+```
 
-3. Install all Python dependencies:
+#### Option B: 🛠️ Manual Setup (All Platforms)
+To manually set up your environment:
+1. **Install Python dependencies:**
    ```bash
    uv sync
    ```
-
-4. Install desktop app dependencies:
+2. **Install frontend dependencies:**
    ```bash
    cd desktop
    npm install
    cd ..
    ```
 
+---
+
+## 📂 Service Data Directory & Workspace Layout
+
+OpenSecAI stores all analysis data locally. When you configure the application (via settings in the UI), you define a **Service Data Directory** (the global data root) which holds the workspaces and scan reports for **all** projects created within the app.
+
+To prepare a repository for scanning:
+1. **Locate your configured Service Data Directory** (in Dev/CLI mode, this defaults to the root of this cloned `OpenSecAI` repository).
+2. **Clone the target repository** you want to scan directly inside the `workspaces/` directory of your Service Data Directory:
+   ```bash
+   # Navigate to your Service Data Directory
+   cd /path/to/your/service-data-dir
+   
+   # Clone the target repository into workspaces/
+   mkdir -p workspaces
+   cd workspaces
+   git clone <your-target-repo-url>
+   ```
+3. In the Tauri GUI (or when setting the `PROJECT` environment variable on the CLI), specify the folder name of the cloned repository (e.g., `your-target-repo`) as the **Workspace Name**.
+
+All scan results, events, and diff reports will be generated automatically in the `reports/` directory adjacent to `workspaces/` (categorized by project name).
 
 ---
 
 ## 💻 Running the App
+
+### Running the Tauri Desktop App (GUI)
+To start the app in development mode (spawns both the Tauri desktop frame and the Python sidecar automatically):
+```bash
+make run-dev
+```
 
 ### Running the CLI Agent (Local Dev)
 To run the default agent (`dep_scan`) directly on your CLI against a target workspace:
@@ -191,12 +213,6 @@ To run the default agent (`dep_scan`) directly on your CLI against a target work
 export PROJECT=my-go-service
 # Target workspace must exist under workspaces/my-go-service/ and contain a go.mod
 make run
-```
-
-### Running the Tauri Desktop App (GUI)
-To start the app in development mode (spawns both the Tauri desktop frame and the Python sidecar automatically):
-```bash
-make run-dev
 ```
 
 ### Running the API Sidecar Independently
@@ -239,8 +255,45 @@ Follow this recipe to add a new security domain agent:
    opensecai-<agent_name> = "opensecai.agents.<agent_name>.runner:main"
    ```
 3. **Sync Environment**: Run `uv sync` to update the script bindings in your environment.
-4. **Implement Graph**: Inherit the context and register nodes using LangGraph's `StateGraph`. Ensure all paths are safely resolved via `opensecai/core/paths.py`.
-5. **Add Tests**: Create unit tests under `tests/unit/agents/` and mocking fixtures under `tests/fixtures/`.
+4. **Implement Graph & State**:
+   * Define the typed `AgentState` in `state.py` (with thread safety variables like `log_fn` and `cancel_event`).
+   * Inherit the context and register nodes using LangGraph's `StateGraph` in `graph.py` / `nodes.py`. Ensure all paths are safely resolved via `opensecai/core/paths.py`.
+   * Implement execution tracking using `_run_tracked` for any spawned subprocesses so they can be terminated properly.
+5. **Configure Human-in-the-Loop (HITL) Pauses (Optional)**:
+   If your agent needs to pause and prompt the user for decisions:
+   * Create `contracts.py` in your agent package and define/register a `PauseContract` with selection options:
+     ```python
+     from opensecai.runtime.notification_contracts import register, PauseContract, PauseOption
+     register(PauseContract(
+         name="<agent_name>.some_decision",
+         prompt="How should the agent proceed?",
+         options=(
+             PauseOption(value="go", label="Continue", desc="...", variant="primary"),
+             PauseOption(value="stop", label="Abort", desc="...", variant="ghost"),
+         ),
+     ))
+     ```
+   * In your graph nodes, call `interrupt({"contract": "<agent_name>.some_decision", "context": {...}})` to trigger the pause.
+   * Import this contracts module inside your agent's registry runner in `agent_registry.py` (e.g. `import opensecai.agents.<agent_name>.contracts`) so the registration side-effect occurs at startup.
+6. **Register in Sidecar Registry**: Add your runner function mapping to the `AGENT_RUNNERS` dictionary inside `opensecai/runtime/agent_registry.py`:
+   ```python
+   AGENT_RUNNERS = {
+       "dep_scan": _run_dep_scan,
+       "<agent_name>": _run_<agent_name>,
+   }
+   ```
+   *Note: Registering the runner in this dictionary publishes the agent to the backend routes (GET /agents and POST /agents/{name}/run).*
+7. **Register in Frontend (UI)**: Add your agent's metadata (id, name, title, description, and icon) to the `AGENTS` array inside `desktop/src/mockData.ts` so that it renders as an active tile on the dashboard:
+   ```typescript
+   export const AGENTS: Agent[] = [
+     {
+       id: "<agent_name>", name: "<agent_name>", title: "My Scan", icon: "shield", enabled: true,
+       short: "...", desc: "...", scanner: "...", scannerNote: "..."
+     },
+     ...
+   ];
+   ```
+8. **Add Tests**: Create unit tests under `tests/unit/agents/` and mocking fixtures under `tests/fixtures/`.
 
 ---
 
