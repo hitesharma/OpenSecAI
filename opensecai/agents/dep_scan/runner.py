@@ -503,8 +503,8 @@ def diff_report_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
         _log(runtime, f"❌ Cannot diff — missing report file: {e}", err=True)
         return {}
 
-    start_df = pl.DataFrame({"id": [v.get("VulnerabilityID") for v in start_vulns]})
-    end_df = pl.DataFrame({"id": [v.get("VulnerabilityID") for v in end_vulns]})
+    start_df = pl.DataFrame({"id": [v.get("VulnerabilityID") for v in start_vulns]}, schema={"id": pl.String})
+    end_df = pl.DataFrame({"id": [v.get("VulnerabilityID") for v in end_vulns]}, schema={"id": pl.String})
 
     start_only_ids = set(start_df.join(end_df, on="id", how="anti")["id"].to_list())
     end_only_ids = set(end_df.join(start_df, on="id", how="anti")["id"].to_list())
