@@ -68,22 +68,31 @@ async def _run_dep_scan(job_id: str, project: str, repo_path: str | None, emit: 
     import opensecai.agents.dep_scan.contracts  # noqa: F401 — side-effect registration
     from opensecai.agents.dep_scan.runner import build_workflow, cleanup_run, make_initial_state
     from opensecai.core.paths import agent_run_dir
+    from opensecai.languages import detect_toolchain, supported_languages
     from langgraph.checkpoint.memory import MemorySaver
     from langgraph.types import Command
 
     # ── Phase 1: pre-workflow setup ──────────────────────────────────────────
     try:
         root_dir, resolved_repo = _resolve_project(project, repo_path)
-        if not os.path.exists(os.path.join(resolved_repo, "go.mod")):
-            raise RuntimeError(f"No go.mod found in {resolved_repo}")
+        detected = detect_toolchain(resolved_repo)
+        if detected is None:
+            raise RuntimeError(
+                f"No supported language detected in {resolved_repo}. "
+                f"Supported: {supported_languages()}."
+            )
 
-        await emit("log", f"▶️  dep_scan starting (project={project}, cwd={resolved_repo})")
+        await emit(
+            "log",
+            f"▶️  dep_scan starting (project={project}, cwd={resolved_repo}, language={detected.name})",
+        )
 
         initial_state = make_initial_state(
             project=project,
             root_dir=root_dir,
             repo_path=resolved_repo,
             job_id=job_id,
+            language=detected.name,
         )
         run_id: str = initial_state["run_id"]
         events_path = agent_run_dir(root_dir, project, "dep_scan", run_id) / "events.jsonl"
