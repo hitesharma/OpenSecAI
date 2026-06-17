@@ -1,7 +1,13 @@
-"""dep_scan agent — Go dependency vulnerability scan + auto-remediation.
+"""dep_scan agent — dependency vulnerability scan + auto-remediation.
 
-State (project, repo_path, run_id, cwd) is threaded through every node so
-concurrent runs from the FastAPI sidecar don't collide on module globals.
+Language-agnostic: the active LanguageToolchain (resolved from AgentState.language)
+owns all language-specific commands (tidy, upgrade, static-analysis, file-error
+regex, and LLM/Claude prompt fragments). To add a new language, implement
+LanguageToolchain in opensecai/languages/ and register it in
+opensecai/languages/registry.py.
+
+State (project, repo_path, run_id, cwd, language) is threaded through every node
+so concurrent runs from the FastAPI sidecar don't collide on module globals.
 
 Runtime-only objects (log_fn, cancel_event) are passed via LangGraph's
 context_schema mechanism so they never enter the checkpoint — MemorySaver
@@ -31,6 +37,8 @@ from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
 
 from opensecai.core.paths import agent_run_dir, project_reports_dir, workspaces_root
+from opensecai.languages import detect_toolchain, get_toolchain, supported_languages
+from opensecai.languages.base import LanguageToolchain
 
 load_dotenv()
 
@@ -59,6 +67,9 @@ class AgentState(TypedDict, total=False):
     run_id: str
     run_ts_iso: str
     cwd: str
+    # Name of the language toolchain that handles this run (e.g. "go", "nodejs").
+    # Resolved at make_initial_state() time via languages.detect_toolchain().
+    language: str
     # UUID job_id from the sidecar — plain string so LangGraph can pass it
     # through state safely.
     job_id: str
@@ -102,6 +113,11 @@ def _index_dir(state: AgentState) -> str:
 
 def _cwd(state: AgentState) -> str:
     return state.get("cwd") or os.getcwd()
+
+
+def _toolchain(state: AgentState) -> LanguageToolchain:
+    """Resolve the language toolchain for this run from state."""
+    return get_toolchain(state["language"])
 
 
 def _run_tracked(state: AgentState, cmd: list, **kwargs) -> subprocess.CompletedProcess:
@@ -170,7 +186,9 @@ def scan_trivy_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
         result = _run_tracked(
             state,
             ["trivy", "fs", "--format", "json", "--severity",
-             "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL", "--pkg-types", "library", "."],
+             "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL", "--pkg-types", "library",
+             "--skip-dirs", ".venv,__pycache__,node_modules,vendor,pre-upgrade",
+             "."],
             capture_output=True, text=True, check=True, env=env, cwd=_cwd(state),
         )
         report_path = os.path.join(_run_dir(state), "start.json")
@@ -228,17 +246,18 @@ def update_dependencies_node(state: AgentState, runtime: Runtime[RunContext]) ->
             seen[pkg] = version
 
     cwd = _cwd(state)
-    _log(runtime, "🧹 Tidying go.mod (pre-upgrade)...")
-    subprocess.run(["go", "mod", "tidy"], capture_output=True, cwd=cwd)
+    tc = _toolchain(state)
+    _log(runtime, f"🧹 Tidying ({tc.name}) dependency manifest (pre-upgrade)...")
+    tc.tidy(cwd)
 
-    _log(runtime, f"🆙 Upgrading {len(seen)} Go package(s) to their fixed versions...")
+    _log(runtime, f"🆙 Upgrading {len(seen)} {tc.name} package(s) to their fixed versions...")
     for pkg, version in seen.items():
-        go_version = version if version.startswith("v") else f"v{version}"
-        target = f"{pkg}@{go_version}"
-        _log(runtime, f"  -> go get {target}")
-        res = subprocess.run(["go", "get", target], capture_output=True, text=True, cwd=cwd)
-        if res.returncode != 0:
-            _log(runtime, f"  ⚠️  Failed to upgrade {target}: {res.stderr.strip()}", err=True)
+        _log(runtime, f"  -> upgrade {pkg}@{version}")
+
+    results = tc.upgrade_packages(cwd, seen)
+    for result in results:
+        if not result.ok:
+            _log(runtime, f"  ⚠️  Failed to upgrade {result.package}@{result.version}: {result.stderr}", err=True)
 
     return {}
 
@@ -247,14 +266,16 @@ def update_dependencies_node(state: AgentState, runtime: Runtime[RunContext]) ->
 def run_tests_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
     _check_cancel(runtime)
     cwd = _cwd(state)
-    _log(runtime, "🛠️ Performing static analysis of codebase...")
-    subprocess.run(["go", "mod", "tidy"], capture_output=True, cwd=cwd)
-    build_res = _run_tracked(state, ["go", "vet", "./..."], capture_output=True, text=True, cwd=cwd)
+    tc = _toolchain(state)
+    _log(runtime, f"🛠️ Performing static analysis of codebase ({tc.name})...")
+    build_res = tc.static_analysis(_run_tracked, state, cwd)
 
     if build_res.returncode != 0:
+        # Some tools (e.g. tsc/ruff) write to stdout; others (e.g. go vet) use stderr.
+        error_output = build_res.stderr or build_res.stdout or ""
         _log(runtime, "❌ Breaking changes detected.")
-        _log(runtime, f"{build_res.stderr}")
-        return {"test_passed": False, "build_logs": build_res.stderr}
+        _log(runtime, error_output)
+        return {"test_passed": False, "build_logs": error_output}
 
     _log(runtime, "✅ Static analysis passed!")
     return {"test_passed": True, "build_logs": ""}
@@ -269,7 +290,8 @@ def analyze_and_fix_node(state: AgentState, runtime: Runtime[RunContext]) -> dic
 
     _log(runtime, f"🤖 Agent fixing breaking changes (Attempt {iterations + 1}/3)...")
 
-    match = re.search(r"(([a-zA-Z0-9_\-]+/\#)?([a-zA-Z0-9_\-\.\/]+)\.go):(\d+):", logs)
+    tc = _toolchain(state)
+    match = tc.file_error_regex().search(logs)
     if not match:
         _log(runtime, "Could not determine file path from error logs. Aborting.")
         return {"iterations": iterations + 1}
@@ -287,8 +309,7 @@ def analyze_and_fix_node(state: AgentState, runtime: Runtime[RunContext]) -> dic
     llm = init_chat_model(model="gemma-4-26b-a4b-it", model_provider="openai", temperature=0.0)
 
     system_prompt = (
-        "You are an expert Go developer specialized in migrating breaking API updates, "
-        "handling package deprecations, or matching changed initialization signatures.\n"
+        f"{tc.expert_role}\n"
         "Analyze the provided build error and file contents, and return the ENTIRE corrected "
         "file content inside standard markdown code blocks. Do not explain anything else."
     )
@@ -299,7 +320,7 @@ def analyze_and_fix_node(state: AgentState, runtime: Runtime[RunContext]) -> dic
     )
 
     response = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_content)])
-    code_match = re.search(r"```go\n(.*?)```", response.content, re.DOTALL)
+    code_match = re.search(rf"```{re.escape(tc.code_fence)}\n(.*?)```", response.content, re.DOTALL)
     fixed_code = code_match.group(1) if code_match else response.content.strip("`")
 
     with open(file_path, "w") as f:
@@ -325,7 +346,7 @@ def claude_code_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
 
     prompt = "Review the codebase and fix any compilation errors or test failures."
     if logs:
-        prompt = f"fix the go vet err:\n{logs}\n"
+        prompt = _toolchain(state).build_error_prompt(logs)
     elif affected_vulns:
         prompt = (
             f"Trivy scan detected these vulnerabilities with no upstream fix:\n"
@@ -470,7 +491,9 @@ def final_scan_node(state: AgentState, runtime: Runtime[RunContext]) -> dict:
         result = _run_tracked(
             state,
             ["trivy", "fs", "--format", "json", "--severity",
-             "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL", "--pkg-types", "library", "."],
+             "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL", "--pkg-types", "library",
+             "--skip-dirs", ".venv,__pycache__,node_modules,vendor,pre-upgrade",
+             "."],
             capture_output=True, text=True, check=True, env=env, cwd=_cwd(state),
         )
         report_path = os.path.join(_run_dir(state), "end.json")
@@ -593,6 +616,7 @@ def make_initial_state(
     root_dir: str,
     repo_path: str,
     job_id: str = "",
+    language: str | None = None,
 ) -> AgentState:
     """Build the AgentState used to invoke() the graph.
 
@@ -600,9 +624,25 @@ def make_initial_state(
     reports are written under <root_dir>/reports/<project>/<agent>/<run_id>/.
     job_id is the UUID assigned by the sidecar; empty string in CLI mode.
 
+    language is the toolchain name; when omitted it is auto-detected from the
+    repo manifest via languages.detect_toolchain().
+
     Runtime-only objects (log_fn, cancel_event) are passed via context= on
     each invoke() call so they never enter the msgpack-serialized checkpoint.
     """
+    if language is None:
+        detected = detect_toolchain(repo_path)
+        if detected is None:
+            raise RuntimeError(
+                f"No supported language detected in {repo_path}. "
+                f"Supported: {supported_languages()}."
+            )
+        language = detected.name
+    elif language not in supported_languages():
+        raise ValueError(
+            f"Unsupported language {language!r}. Supported: {supported_languages()}."
+        )
+
     now = datetime.datetime.now(datetime.timezone.utc)
     return {
         "project": project,
@@ -611,6 +651,7 @@ def make_initial_state(
         "run_id": now.strftime("%Y%m%d_%H%M%S"),
         "run_ts_iso": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "cwd": repo_path,
+        "language": language,
         "job_id": job_id,
         "fixed_vulns": [],
         "affected_vulns": [],
@@ -626,7 +667,7 @@ def make_initial_state(
 # ── CLI Entrypoint ──────────────────────────────────────────────────────────
 @click.command()
 def main() -> None:
-    """Go Project Security Scanning and Healing CLI Agent (dep_scan)."""
+    """Dependency vulnerability scan + auto-remediation CLI agent (dep_scan)."""
     project = os.environ.get("PROJECT", "")
     repo = os.environ.get("REPO") or project  # historical: REPO defaults to PROJECT
 
@@ -642,20 +683,27 @@ def main() -> None:
     root_dir = record.root_dir if record else str(data_root())
 
     repo_path = os.environ.get("REPO_PATH") or str(workspaces_root() / repo)
-    if not os.path.exists(os.path.join(repo_path, "go.mod")):
-        click.echo(f"❌ Error: No go.mod found in {repo_path}.", err=True)
+    detected = detect_toolchain(repo_path)
+    if detected is None:
+        click.echo(
+            f"❌ Error: no supported language detected in {repo_path}. "
+            f"Supported: {supported_languages()}.",
+            err=True,
+        )
         sys.exit(1)
 
     if not os.environ.get("OPENAI_API_KEY"):
         click.echo("❌ Error: OPENAI_API_KEY environment variable is not set.", err=True)
         sys.exit(1)
 
-    click.echo(f"📂 Targeting directory: {repo_path}")
+    click.echo(f"📂 Targeting directory: {repo_path} (language: {detected.name})")
 
     from langgraph.checkpoint.memory import MemorySaver
 
     checkpointer = MemorySaver()
-    initial_state = make_initial_state(project=project, root_dir=root_dir, repo_path=repo_path)
+    initial_state = make_initial_state(
+        project=project, root_dir=root_dir, repo_path=repo_path, language=detected.name
+    )
     run_id = initial_state["run_id"]
     config = {"configurable": {"thread_id": run_id}}
     ctx = {"log_fn": None, "cancel_event": None}
